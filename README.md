@@ -12,3 +12,12 @@
 
 ## 状态
 Go 库已编译并通过 C 程序调用验证；C++ 插件尚未在真实 MySQL 源码树中编译（环境中无 MySQL 源码）。
+
+## 验证结果（MySQL 8.0.40）
+- `CREATE TABLE ... ENGINE=MyEngine` -> `create`、`open`、`[go] Open`
+- `INSERT` -> `write_row` -> `[go] Put ... swallowed`，客户端 `Query OK`
+- `SELECT * FROM t1` -> `rnd_init`、`rnd_next -> HA_ERR_END_OF_FILE`，`Empty set`
+- `SELECT * FROM t1 WHERE id = 1` -> `index_init`、`index_read_map`、`[go] Seek`，`Empty set`
+
+注意：不要声明 `HA_STATS_RECORDS_IS_EXACT`，否则优化器认定表为空，永远不会下探索引。
+引擎必须重写 `max_supported_keys` 等，否则 `PRIMARY KEY` 建表报 ERROR 1069。

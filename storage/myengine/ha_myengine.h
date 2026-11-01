@@ -14,8 +14,12 @@ class ha_myengine : public handler {
   ~ha_myengine() override = default;
 
   const char *table_type() const override { return "MyEngine"; }
-  ulonglong table_flags() const override { return HA_NO_TRANSACTIONS | HA_STATS_RECORDS_IS_EXACT; }
-  ulong index_flags(uint, uint, bool) const override { return 0; }
+  ulonglong table_flags() const override { return HA_NO_TRANSACTIONS; }
+  ulong index_flags(uint, uint, bool) const override { return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE; }
+  uint max_supported_keys() const override { return 64; }
+  uint max_supported_key_parts() const override { return 16; }
+  uint max_supported_key_length() const override { return 3072; }
+  uint max_supported_key_part_length(HA_CREATE_INFO *) const override { return 3072; }
 
   int create(const char *name, TABLE *form, HA_CREATE_INFO *info, dd::Table *dd) override;
   int open(const char *name, int mode, uint test_if_locked, const dd::Table *dd) override;
