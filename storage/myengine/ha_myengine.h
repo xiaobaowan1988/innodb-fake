@@ -14,7 +14,7 @@ class ha_myengine : public handler {
   ~ha_myengine() override = default;
 
   const char *table_type() const override { return "MyEngine"; }
-  ulonglong table_flags() const override { return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ; }
+  ulonglong table_flags() const override { return HA_NO_TRANSACTIONS | HA_STATS_RECORDS_IS_EXACT; }
   ulong index_flags(uint, uint, bool) const override { return 0; }
 
   int create(const char *name, TABLE *form, HA_CREATE_INFO *info, dd::Table *dd) override;
