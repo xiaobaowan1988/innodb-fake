@@ -397,6 +397,7 @@ void ha_myengine::close_cursor() {
 void ha_myengine::open_cursor(uint idx) {
   close_cursor();
   cur = MyEngine_CursorOpen(txn_h, tbl_h, idx, row_lock, pk_width, wait_policy);
+  if (semi_consistent) MyEngine_CursorSemi(cur, 1);
 }
 
 // 每行只跨一次语言边界：Go 端完成 移动游标 + 可见性判断/加锁 + (二级索引)回表 + 拷出整行。
@@ -480,6 +481,13 @@ int ha_myengine::rnd_init(bool scan) {
 }
 
 // 服务器在 READ COMMITTED 下发现当前行不满足 WHERE 时调用：把这次扫描刚取到的行锁提前放掉（与 InnoDB 一致）。
+bool ha_myengine::was_semi_consistent_read() { return cur && MyEngine_CursorWasSemi(cur) != 0; }
+
+void ha_myengine::try_semi_consistent_read(bool yes) {
+  semi_consistent = yes;
+  if (cur) MyEngine_CursorSemi(cur, yes ? 1 : 0);
+}
+
 void ha_myengine::unlock_row() {
   if (cur) MyEngine_CursorUnlockRow(cur);
 }

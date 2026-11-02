@@ -587,6 +587,22 @@ def rc_failed_multirow_insert_leaves_no_lock(c):
     c.run("Q", "INSERT INTO gw VALUES (16, 8, 0)")
     c.run("R", "ROLLBACK")
 
+@scenario
+def rc_update_semi_consistent_read(c):
+    # RC 的 UPDATE：别人未提交的插入行（没有已提交版本）直接跳过，不等；已提交版本不匹配 WHERE 的被锁行也不等；匹配的被锁行才等。RR 全部要等
+    c.conn("A"); c.conn("B"); c.conn("R"); c.conn("Q")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (25, 5, 0)")                # 未提交的插入
+    c.run("A", "UPDATE gw SET v=100 WHERE id=30")                                      # 30：已提交 v=0，未提交改成 100
+    c.run("B", "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    c.run("B", "UPDATE gw SET v=7 WHERE id BETWEEN 24 AND 26")                          # 只扫到未提交的 25：跳过，影响 0 行
+    c.run("B", "UPDATE gw SET v=7 WHERE id BETWEEN 25 AND 30 AND v=100")                # 30 的已提交版本 v=0 不匹配：不等
+    c.run("B", "UPDATE gw SET v=7 WHERE id BETWEEN 25 AND 30 AND v=0")                  # 30 的已提交版本匹配：要等（收尾解除）
+    c.run("A", "ROLLBACK")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (25, 5, 0)")
+    c.run("R", "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    c.run("R", "UPDATE gw SET v=7 WHERE id BETWEEN 24 AND 26")                          # RR：要等
+    c.run("A", "ROLLBACK")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--socket", required=True)
     ap.add_argument("--only"); ap.add_argument("--timeout-tests", action="store_true"); ap.add_argument("-v", action="store_true")

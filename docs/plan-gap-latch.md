@@ -385,3 +385,18 @@ SQL 场景 63/63 与 InnoDB 一致（新增 `entry_lock_dup_error_only_blocks_in
     RR 下 InnoDB 留有已删除标记的残留记录，别人仍被挡——这是已知差异的另一面，我们 RR 下保持现状（两边都挡）。
     修法：`Txn.fresh` 记录本语句里新取得行锁的插入；RC 下 `RollbackStmt` 撤销之后，凡是行已不属于本事务的就放锁。
     验证：单元测试 `TestRollbackStmtReleasesInsertLockUnderRC`（RC 放、RR 不放）+ txn_check 场景 + 差分重跑 seed 122。
+
+## v12：RC 下 UPDATE 的半一致读（seed 100）
+
+**现象**：RC 下 `UPDATE t SET k=0 WHERE id BETWEEN 4 AND 5`，5 号行只有另一事务未提交的插入。InnoDB 直接跳过（不等），我们阻塞。
+**InnoDB 语义**（`handler::try_semi_consistent_read` / `was_semi_consistent_read`，8.0 里只有 UPDATE / 多表 UPDATE 打开）：
+RU/RC 下，加锁扫描遇到会等待的行时，不等锁，改为返回该行"最近已提交的版本"（没有已提交版本、或已提交版本是删除 -> 直接跳过这行）。
+服务器用 WHERE 判断：不满足 -> `unlock_row()`（行从未加锁，什么也不用做）；满足 -> 调 `was_semi_consistent_read()`，
+返回 true 就丢弃这行，**下一次读调用对同一行重新读，这次带锁（会等）**。RR/SERIALIZABLE 无效；DELETE / SELECT FOR UPDATE 不用半一致读。
+**实现**：
+- C++：`try_semi_consistent_read(bool)` 存成员 `semi_`，`open_cursor` 时传给游标；`was_semi_consistent_read()` 调 Go。
+- Go `Cursor`：`semi`（仅 RC 且加锁读 X 生效）、`semiRead`（刚返回的是乐观读）、`semiPending/semiPk/semiFresh`（下一次读要对该行重读加锁）。
+  `advance` 的加锁路径：`semi` 时先用 `waitSkip` 策略试取锁；冲突就取最新已提交版本（无/已删除则跳过本行），返回并置 `semiRead`，不留锁。
+  `WasSemi()`：`semiRead` 为真则转成 `semiPending` 并返回 true。下一次 `advance`（非 seek）若 `semiPending`：对 `semiPk` 正常（可等待）取锁，
+  行还在就返回（`lastFresh` 取首次的 !had）；行已被删就按普通逻辑继续扫描。`Seek` 或游标关闭清除 pending。
+**验证**：单元测试（RC 下跳过未提交插入行/不匹配的锁定行；匹配的行等待后返回；RR 不受影响）、txn_check 场景对照 InnoDB、seed 100 重跑。

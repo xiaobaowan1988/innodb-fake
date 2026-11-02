@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -925,6 +926,121 @@ func TestRollbackStmtReleasesInsertLockUnderRC(t *testing.T) {
 			<-res
 		}
 	}
+}
+
+// RC 下 UPDATE 的半一致读：被别人锁着的行返回最近已提交版本，不等；没有已提交版本的（未提交插入）直接跳过；
+// 服务器要这一行时（WasSemi）下一次读才带锁等待。RR 不受影响（照常等待）。
+func TestSemiConsistentRead(t *testing.T) {
+	setup := func() (*Engine, *table, *Txn) {
+		e, tb := newTestEngine(t)
+		s := e.Begin(isoRepeatableRead)
+		for i := 1; i <= 3; i++ {
+			mustInsert(t, e, s, tb, i, i)
+		}
+		e.Commit(s)
+		w := e.Begin(isoRepeatableRead)
+		if err := e.Update(w, tb, pk4(2), pk4(2), row8(20), secs(20, false)); err != nil { // 2：未提交的修改，已提交版本是旧值
+			t.Fatal(err)
+		}
+		mustInsert(t, e, w, tb, 4, 4) // 4：未提交的插入，没有已提交版本
+		return e, tb, w
+	}
+	type stepRes struct {
+		row []byte
+		err error
+	}
+	var pending chan stepRes // 被阻塞的那次 Step，收尾时必须等它结束（Txn 只能单协程使用）
+	step := func(c *Cursor) (row []byte, err error, blocked bool) {
+		ch := make(chan stepRes, 1)
+		go func() { row, err := c.Step(1); ch <- stepRes{row, err} }()
+		select {
+		case x := <-ch:
+			return x.row, x.err, false
+		case <-time.After(200 * time.Millisecond):
+			pending = ch
+			return nil, nil, true
+		}
+	}
+	// 服务器过滤掉被锁行：不等，跳过 4，取到 3，行 2 没有被锁住
+	e, tb, w := setup()
+	a := e.Begin(isoReadCommitted)
+	c := e.OpenCursor(a, tb, 0, lockX, 4)
+	c.SetSemiConsistent(true)
+	if _, err := c.Seek(nil, seekFirst); err != nil {
+		t.Fatal(err)
+	}
+	row, err, blocked := step(c)
+	if blocked || err != nil || !c.semiRead {
+		t.Fatalf("row 2 must come back optimistically, blocked=%v err=%v semi=%v", blocked, err, c.semiRead)
+	}
+	if !bytes.Equal(row, row8(2)) {
+		t.Fatalf("optimistic row must be the committed version, got %v", row)
+	}
+	c.UnlockLast() // 不匹配 WHERE：没有锁可放，不能出错
+	row, err, blocked = step(c)
+	if blocked || err != nil {
+		t.Fatalf("scan must skip the uncommitted insert, blocked=%v err=%v", blocked, err)
+	}
+	if !bytes.Equal(row, row8(3)) {
+		t.Fatalf("want row 3, got %v", row)
+	}
+	e.Rollback(a)
+	// 服务器要这一行：WasSemi 为真，下一次读带锁等待，w 结束后返回
+	a2 := e.Begin(isoReadCommitted)
+	c2 := e.OpenCursor(a2, tb, 0, lockX, 4)
+	c2.SetSemiConsistent(true)
+	if _, err := c2.Seek(nil, seekFirst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err, blocked := step(c2); blocked || err != nil || !c2.WasSemi() {
+		t.Fatalf("row 2 must be optimistic and WasSemi true (blocked=%v err=%v)", blocked, err)
+	}
+	if _, err, blocked := step(c2); !blocked {
+		t.Fatalf("re-read must wait for the lock, got err=%v", err)
+	}
+	e.Rollback(w)
+	if x := <-pending; x.err != nil || !bytes.Equal(x.row, row8(2)) {
+		t.Fatalf("re-read after release must return row 2, got %v %v", x.row, x.err)
+	}
+	e.Rollback(a2)
+	// 乐观读返回的恰好是唯一终点的行（BETWEEN .. AND 2）：服务器要它时，下一次读仍要带锁重读，不能因为"到终点"直接结束
+	w4 := e.Begin(isoRepeatableRead)
+	if err := e.Update(w4, tb, pk4(3), pk4(3), row8(30), secs(30, false)); err != nil {
+		t.Fatal(err)
+	}
+	a4 := e.Begin(isoReadCommitted)
+	c4 := e.OpenCursor(a4, tb, 0, lockX, 4)
+	c4.SetSemiConsistent(true)
+	c4.SetBoundU(2, pk4(3), true, true)
+	if _, err := c4.Seek(nil, seekFirst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err, blocked := step(c4); blocked || err != nil {
+		t.Fatalf("row 2 (a4's first Step) should return: blocked=%v err=%v", blocked, err)
+	}
+	if row, err, blocked := step(c4); blocked || err != nil || !c4.WasSemi() || !bytes.Equal(row, row8(3)) {
+		t.Fatalf("row 3 must be optimistic: %v %v %v", row, err, blocked)
+	}
+	if x, err, blocked := step(c4); !blocked {
+		t.Fatalf("re-read of the endpoint row must wait for the lock, got %v %v", x, err)
+	}
+	e.Rollback(w4)
+	<-pending
+	e.Rollback(a4)
+	// RR：不启用半一致读，照常等待
+	e3, tb3, w3 := setup()
+	a3 := e3.Begin(isoRepeatableRead)
+	c3 := e3.OpenCursor(a3, tb3, 0, lockX, 4)
+	c3.SetSemiConsistent(true)
+	if _, err := c3.Seek(nil, seekFirst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err, blocked := step(c3); !blocked {
+		t.Fatalf("RR must wait on the locked row, got err=%v", err)
+	}
+	e3.Rollback(w3)
+	<-pending
+	e3.Rollback(a3)
 }
 
 // RC 下加锁扫描遇到不匹配的行，UnlockLast 放掉它；RR 下不放。

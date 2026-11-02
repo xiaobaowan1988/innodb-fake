@@ -288,9 +288,25 @@ func MyEngine_CursorSeekFetch(h C.ulonglong, key unsafe.Pointer, klen C.size_t, 
 	return finishFetch(row, err, out, capacity, outlen)
 }
 
-// CursorBound 设置扫描边界：kind 0 清除，1 同键前缀，2 正向终点，3 反向终点；unique 表示终点是唯一索引的全键。
-// 越过边界的第一个条目只会让它前面的间隙被锁住（RR/SERIALIZABLE 的加锁读），不会锁它的行。
+// CursorSemi 对应 handler::try_semi_consistent_read。
 //
+//export MyEngine_CursorSemi
+func MyEngine_CursorSemi(h C.ulonglong, on C.int) {
+	if c := curOf(h); c != nil {
+		c.SetSemiConsistent(on != 0)
+	}
+}
+
+// CursorWasSemi 对应 handler::was_semi_consistent_read。
+//
+//export MyEngine_CursorWasSemi
+func MyEngine_CursorWasSemi(h C.ulonglong) C.int {
+	if c := curOf(h); c != nil && c.WasSemi() {
+		return 1
+	}
+	return 0
+}
+
 // CursorUnlockRow 对应 handler::unlock_row：当前行不满足 WHERE，RC 下提前放锁。
 //
 //export MyEngine_CursorUnlockRow
@@ -300,6 +316,9 @@ func MyEngine_CursorUnlockRow(h C.ulonglong) {
 	}
 }
 
+// CursorBound 设置扫描边界：kind 0 清除，1 同键前缀，2 正向终点，3 反向终点；unique 表示终点是唯一索引的全键。
+// 越过边界的第一个条目只会让它前面的间隙被锁住（RR/SERIALIZABLE 的加锁读），不会锁它的行。
+//
 //export MyEngine_CursorBound
 func MyEngine_CursorBound(h C.ulonglong, kind C.int, key unsafe.Pointer, klen C.size_t, inclusive C.int, unique C.int) {
 	if c := curOf(h); c != nil {

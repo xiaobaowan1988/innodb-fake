@@ -1289,6 +1289,13 @@ type Cursor struct {
 	lastPk    []byte
 	lastFresh bool
 
+	// RC 下 UPDATE 的半一致读（见 plan v12）
+	semi        bool   // 服务器打开了 try_semi_consistent_read
+	semiRead    bool   // 刚返回的行是乐观读（没加锁）
+	semiPending bool   // 服务器要这行：下一次读对 semiPk 带锁重读
+	semiPk      []byte // 乐观读的那一行
+	semiFresh   bool   // 重读时的锁是不是新取的
+
 	// 扫描边界（见 gap.go）
 	bKind      int // 外部设置的边界（SetBound）
 	bKey       []byte
@@ -1305,6 +1312,39 @@ type batchEnt struct {
 
 // SetWaitPolicy 设置加锁读的等待策略（SELECT ... FOR UPDATE NOWAIT / SKIP LOCKED）。
 func (c *Cursor) SetWaitPolicy(p int) { c.policy = p }
+
+// SetSemiConsistent 对应 handler::try_semi_consistent_read。
+func (c *Cursor) SetSemiConsistent(on bool) {
+	c.semi = on
+	c.semiRead, c.semiPending = false, false
+}
+
+// WasSemi 对应 handler::was_semi_consistent_read：上一行是乐观读的话，服务器想要它，下一次读要带锁重读同一行。
+func (c *Cursor) WasSemi() bool {
+	if c.semiRead {
+		c.semiRead, c.semiPending = false, true
+		return true
+	}
+	return false
+}
+
+// latestCommitted 返回行最近一个已提交版本的数据；没有或已删除返回 ok=false。
+func (c *Cursor) latestCommitted(pk []byte) (data []byte, ok bool) {
+	c.tbl.withHead(pk, func(h *rowHead) {
+		if h == nil {
+			return
+		}
+		for v := h.head; v != nil; v = v.prev {
+			if v.trx.commitTS.Load() != 0 {
+				if !v.deleted && c.entryMatches(v) {
+					data, ok = v.data, true
+				}
+				return
+			}
+		}
+	})
+	return
+}
 
 func (e *Engine) OpenCursor(t *Txn, tb *table, idx, lock, pkWidth int) *Cursor {
 	c := &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx], batchN: 2}
@@ -1446,9 +1486,32 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		firstUniq = flags&seekUniqueFull != 0 && (mode == seekExact || mode == seekGE)
 		c.done = false
 		c.buf, c.bufPos, c.batchN = c.buf[:0], 0, 2
-	} else if c.done {
+	} else if c.done && !c.semiPending { // 乐观读返回的是唯一终点的行：服务器要它的话还得带锁重读，不能直接结束
 		c.raw.valid = false
 		return nil, ErrNotFound
+	}
+	// 半一致读之后服务器要这一行：Step 走下面的"重读同一行"；MRR 路径会重新 Seek（InnoDB 里同样是"悲观"状态，
+	// 这次搜索不再乐观读，遇到被锁的行就等），所以 Seek 时本次搜索关掉半一致读。
+	pessimistic := false
+	if isSeek && c.semiPending {
+		c.semiPending, pessimistic = false, true
+	}
+	c.semiRead = false
+	if c.semiPending && !isSeek && c.lock != lockNone {
+		// 半一致读：服务器要上一行，这次带锁（会等）重读它
+		c.semiPending = false
+		pk := c.semiPk
+		if err := e.lm.lockPolicy(c.t, c.tbl, pk, c.lock, c.policy); err != nil {
+			return nil, err
+		}
+		if row, ok := c.currentRow(pk); ok {
+			c.lastPk, c.lastFresh = append(c.lastPk[:0], pk...), c.semiFresh
+			c.noteReturned()
+			return row, nil
+		}
+		if c.semiFresh {
+			e.lm.release(c.t, c.tbl, pk)
+		}
 	}
 	for {
 		var rv *ReadView
@@ -1509,8 +1572,23 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		deadKey := c.raw.key
 		_, had := c.t.held[lockKey{c.tbl, 0, string(pk)}]
 		// 加锁读：此刻没有持有任何树锁/gapMu，可以安全地等行锁；醒来后树可能变了，游标会按 key 重新定位
-		if err := e.lm.lockPolicy(c.t, c.tbl, pk, c.lock, c.policy); err != nil {
-			if errors.Is(err, errSkipRow) { // SKIP LOCKED：这一行被别人锁着，跳过，取下一行
+		policy := c.policy
+		semi := c.semi && !pessimistic && c.t.iso == isoReadCommitted && c.lock == lockX && !had && policy == waitNormal
+		if semi {
+			policy = waitSkip // 先不等：冲突时走半一致读
+		}
+		if err := e.lm.lockPolicy(c.t, c.tbl, pk, c.lock, policy); err != nil {
+			if errors.Is(err, errSkipRow) {
+				if semi {
+					// 半一致读：返回最近已提交版本，不留锁；没有已提交版本（别人未提交的插入）或已删除就跳过
+					if row, ok := c.latestCommitted(pk); ok {
+						c.semiRead, c.semiPk, c.semiFresh = true, append(c.semiPk[:0], pk...), !had
+						c.lastFresh = false
+						c.noteReturned()
+						return row, nil
+					}
+				}
+				// SKIP LOCKED：这一行被别人锁着，跳过，取下一行
 				firstUniq = false
 				continue
 			}
