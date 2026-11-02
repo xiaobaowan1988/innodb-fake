@@ -95,6 +95,7 @@ func TestVisibilityRR(t *testing.T) {
 	if v, _ := get(e, rc, tb, 1); v != 10 {
 		t.Fatalf("RC within the same statement should keep its view: %d", v)
 	}
+	rc.StmtEnd()
 	rc.StmtBegin(isoReadCommitted) // 新语句，新视图
 	if v, _ := get(e, rc, tb, 1); v != 20 {
 		t.Fatalf("RC next statement must see committed update: %d", v)
@@ -122,6 +123,7 @@ func TestRollbackAndStmtRollbackAndSavepoint(t *testing.T) {
 		t.Fatalf("after savepoint rollback: %v", got)
 	}
 	// 语句回滚
+	x.StmtEnd()
 	x.StmtBegin(isoRepeatableRead)
 	mustInsert(t, e, x, tb, 5, 50)
 	e.RollbackStmt(x)
@@ -530,4 +532,91 @@ func TestSeekModesWithInvisibleRows(t *testing.T) {
 	if _, err = c.Seek(pk4(4), seekExact); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("EXACT on an invisible row must not slide to a neighbour: %v", err)
 	}
+}
+
+// 一条语句在中途又打开了别的表（触发器、存储函数）：再次 StmtBegin 不是新语句——
+// 语句起点不能被推迟（否则失败时只回滚到较晚的起点，前面的修改残留），READ COMMITTED 的视图也不能被重置。
+func TestNestedStmtBeginDoesNotMoveStatementStart(t *testing.T) {
+	e, tb := newTestEngine(t)
+	tx := e.Begin(isoReadCommitted)
+	tx.StmtBegin(isoReadCommitted)
+	mustInsert(t, e, tx, tb, 1, 1) // 第一个表上的写入
+	tx.StmtBegin(isoReadCommitted) // 触发器中途打开另一个表
+	mustInsert(t, e, tx, tb, 2, 2)
+	e.RollbackStmt(tx) // 语句失败：必须把两行都撤销
+	if n := len(scanAll(e, tx, tb)); n != 0 {
+		t.Fatalf("statement rollback left %d rows behind", n)
+	}
+	// 视图：同一条语句里先读一次，别人提交之后再读，RC 在同一条语句内必须看到同一份快照
+	tx.StmtEnd()
+	tx.StmtBegin(isoReadCommitted)
+	w := e.Begin(isoRepeatableRead)
+	mustInsert(t, e, w, tb, 10, 1)
+	e.Commit(w)
+	before := len(scanAll(e, tx, tb))
+	tx2 := e.Begin(isoRepeatableRead)
+	mustInsert(t, e, tx2, tb, 11, 1)
+	e.Commit(tx2)
+	tx.StmtBegin(isoReadCommitted) // 嵌套：不能换视图
+	if after := len(scanAll(e, tx, tb)); after != before {
+		t.Fatalf("view was replaced in the middle of a statement: %d -> %d rows", before, after)
+	}
+	// 上一条语句 + 事务内先前的语句不受影响：已经提交的修改在语句回滚时保留
+	tx.StmtEnd()
+	tx.StmtBegin(isoReadCommitted)
+	mustInsert(t, e, tx, tb, 20, 1)
+	tx.StmtEnd() // 语句 A 成功结束
+	tx.StmtBegin(isoReadCommitted)
+	mustInsert(t, e, tx, tb, 21, 1)
+	e.RollbackStmt(tx)
+	got := scanAll(e, tx, tb)
+	if _, ok := got[20]; !ok {
+		t.Fatal("rolling back statement B must not undo the earlier statement A")
+	}
+	if _, ok := got[21]; ok {
+		t.Fatal("statement B was not rolled back")
+	}
+}
+
+// 被 KILL 的连接：所有等待都应当在一个轮询周期内返回 ErrKilled，而不是等到锁超时。
+func TestKilledWaitsReturnPromptly(t *testing.T) {
+	e, tb := newTestEngine(t)
+	e.LockTimeout = 30 * time.Second
+	holder := e.Begin(isoRepeatableRead)
+	mustInsert(t, e, holder, tb, 1, 1)
+	var killed atomic.Bool
+	for name, op := range map[string]func(tx *Txn) error{
+		"row lock": func(tx *Txn) error { _, err := e.GetRow(tx, tb, pk4(1), lockX); return err },
+		"insert":   func(tx *Txn) error { return e.Insert(tx, tb, pk4(1), row8(2), secs(2, false)) },
+		"gap wait": func(tx *Txn) error {
+			g := e.Begin(isoRepeatableRead)
+			lockedRangeRead(t, e, g, tb, 100, 200, lockX) // 在 g 上登记一个间隙锁，下面的插入会等它
+			defer e.Rollback(g)
+			return e.Insert(tx, tb, pk4(150), row8(1), secs(1, false))
+		},
+	} {
+		killed.Store(false)
+		tx := e.Begin(isoRepeatableRead)
+		tx.timeout = 30 * time.Second
+		tx.SetKillCheck(func() bool { return killed.Load() })
+		done := make(chan error, 1)
+		go func() { done <- op(tx) }()
+		time.Sleep(200 * time.Millisecond)
+		select {
+		case err := <-done:
+			t.Fatalf("%s: returned early: %v", name, err)
+		default:
+		}
+		killed.Store(true)
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrKilled) {
+				t.Fatalf("%s: want ErrKilled, got %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: a killed wait did not return within 2s", name)
+		}
+		e.Rollback(tx)
+	}
+	e.Rollback(holder)
 }

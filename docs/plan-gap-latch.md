@@ -241,3 +241,15 @@ e.tmu、dmu、pmu 都是叶子锁，内部不再取别的锁
      被杀则退出并返回新的错误码 `rcKilled`；C++ 按 InnoDB 的做法 `thd_set_kill_status(thd)` 后返回 `HA_ERR_GENERIC`。
      用 C 里的一个小跳板函数调用函数指针，避免 Go 库对 `thd_killed` 产生链接期的未定义符号。
   **回归测试**：`scripts/txn_check.py` 增加触发器场景（成功路径、触发器内部失败、显式事务里的语句回滚）和 KILL 场景，与 InnoDB 逐行对照。
+  **修复结果**（v7 的两个问题）：
+  - 语句起点：`Txn` 增加 `inStmt`；`StmtBegin` 只在语句的第一个表打开时生效，`StmtEnd`（由 `hton->commit/rollback` 的 `all=false`
+    钩子调用）才结束一条语句。新增 `MyEngine_TxnStmtEnd`。触发器场景（成功路径、触发器内部失败）与 InnoDB 逐行一致，
+    且"同一事务里前面成功的语句不会被后面失败语句的回滚误撤销"也被验证。
+  - KILL：`Txn.waitOn` 统一所有等待（行锁、间隙冲突、唯一键），每 100ms 检查一次 `thd_killed`；`MyEngine_TxnSetKill` 通过 C 跳板调用
+    C++ 传入的函数指针。`KILL QUERY` 阻塞的语句在 InnoDB 和本引擎都立即返回 1317，连接和对方事务不受影响。
+  - 变异检查：嵌套 `StmtBegin` 重设起点、等待不检查 KILL、KILL 不轮询——三个都被新增的 Go 单测抓到。
+  - 回归：`go test -race -count=2`、216 个结果集、55 个场景（新增 3 个）、并发检查、锁超时与死锁场景全部通过。
+  - 新增 `scripts/concurrency_audit.py` 保留审计时用的探针（S→X 死锁、ODKU 并发、并发改主键、删除再插入的快照一致性、残留锁探测）。
+  **没有发现问题的审计项**也如实记录在上面 v7。
+  **审计的局限**：只测了我想到的场景。没有覆盖的包括：LOCK TABLES 模式下的语句起点（`start_stmt` 与钩子的交互）、外键、
+  存储过程里的游标在同一事务内读自己刚写的行（批量预取对"读到自己后来的修改"是异步的，InnoDB 的游标本来也是 asensitive）。

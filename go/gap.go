@@ -165,14 +165,7 @@ func (lm *lockMgr) waitTxn(t, holder *Txn) error {
 		return ErrDeadlock
 	}
 	lm.dmu.Unlock()
-	var err error
-	timer := time.NewTimer(t.timeout)
-	select {
-	case <-holder.doneCh:
-	case <-timer.C:
-		err = ErrLockTimeout
-	}
-	timer.Stop()
+	err := t.waitOn(holder.doneCh, time.Now().Add(t.timeout))
 	lm.dmu.Lock()
 	t.blockedOn = nil
 	lm.dmu.Unlock()

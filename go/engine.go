@@ -43,7 +43,11 @@ var (
 	ErrNotFound    = errors.New("myengine: not found")
 	ErrDeadlock    = errors.New("myengine: deadlock detected")
 	ErrLockTimeout = errors.New("myengine: lock wait timeout")
+	ErrKilled      = errors.New("myengine: query interrupted")
 )
+
+// killPoll：等待期间每隔这么久检查一次连接是否被 KILL。
+const killPoll = 100 * time.Millisecond
 
 // DupError 表示唯一键冲突；Idx 是冲突的索引号（0 为主键）。
 type DupError struct{ Idx int }
@@ -143,6 +147,8 @@ type Txn struct {
 	timeout  time.Duration
 	undo     []undoRec
 	stmtBeg  int
+	inStmt   bool        // 正在一条（顶层）语句之中：触发器/存储函数里再打开别的表不算新语句
+	killed   func() bool // 连接是否被 KILL（由 C++ 提供 thd_killed）；nil 表示不检查
 	done     bool
 	doneCh   chan struct{}            // 事务结束时关闭（供"等待事务结束"的等待者）
 	gaps     map[*idxState][]*gapLock // 本事务登记的间隙锁（仅所有者访问）
@@ -243,13 +249,52 @@ func (e *Engine) Begin(iso int) *Txn {
 	return t
 }
 
-// StmtBegin 在每条语句开始时调用：记录语句回滚点；非 RR 隔离级别下丢弃上一条语句的视图。
+// StmtBegin 在一条语句打开它的表时调用（external_lock / start_stmt）。
+// 只有这条**顶层语句的第一个表**才算语句开始：记录语句回滚点、（非 RR 时）丢弃上一条语句的视图。
+// 触发器、存储函数在语句中途打开别的表时会再调一次，那不是新语句——重设语句起点会让失败时只回滚到较晚的起点，
+// 前面的修改残留在事务里；重置 READ COMMITTED 的视图则会让同一条语句读到两份快照。
+// 语句结束由 StmtEnd 标记（MySQL 的 hton->commit/rollback 的 all=false 钩子，每条顶层语句结束都会调用）。
 func (t *Txn) StmtBegin(iso int) {
 	t.iso = iso
+	if t.inStmt {
+		return
+	}
+	t.inStmt = true
 	t.stmtBeg = len(t.undo)
 	if iso != isoRepeatableRead && iso != isoSerializable {
 		t.view = nil
 		t.viewSnap.Store(-1)
+	}
+}
+
+// StmtEnd 标记一条顶层语句结束；下一次 StmtBegin 才会开始新语句。
+func (t *Txn) StmtEnd() { t.inStmt = false }
+
+// SetKillCheck 设置"连接是否被 KILL"的检查函数，所有锁等待会定期调用它。
+func (t *Txn) SetKillCheck(f func() bool) { t.killed = f }
+
+// waitOn 等待 ch 被关闭（被唤醒），最长到 deadline；等待期间每 killPoll 检查一次是否被 KILL。
+// 返回 nil 表示被唤醒，ErrLockTimeout 表示超时，ErrKilled 表示连接被 KILL。
+func (t *Txn) waitOn(ch <-chan struct{}, deadline time.Time) error {
+	for {
+		if t.killed != nil && t.killed() {
+			return ErrKilled
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ErrLockTimeout
+		}
+		d := remaining
+		if t.killed != nil && d > killPoll {
+			d = killPoll
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ch:
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
 }
 
@@ -517,18 +562,9 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 		if deadline.IsZero() {
 			deadline = time.Now().Add(t.timeout)
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if err := t.waitOn(w.ch, deadline); err != nil {
 			lm.abandon(t, key, w)
-			return ErrLockTimeout
-		}
-		timer := time.NewTimer(remaining)
-		select {
-		case <-w.ch:
-			timer.Stop()
-		case <-timer.C:
-			lm.abandon(t, key, w)
-			return ErrLockTimeout
+			return err
 		}
 	}
 }

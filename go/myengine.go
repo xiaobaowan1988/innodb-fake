@@ -3,6 +3,11 @@ package main
 /*
 #include <stddef.h>
 #include <stdint.h>
+
+// 跳板：通过函数指针调用 MySQL 的 thd_killed。直接在 Go 库里引用 thd_killed 会产生链接期的未定义符号，
+// 所以让 C++ 把函数指针传进来，这里只负责调用。
+typedef int (*kill_fn_t)(void *);
+static int call_kill_fn(void *fn, void *thd) { return ((kill_fn_t)fn)(thd); }
 */
 import "C"
 
@@ -28,6 +33,7 @@ const (
 	rcTooSmall = 3 // 输出缓冲区不足
 	rcDeadlock = 5
 	rcTimeout  = 6
+	rcKilled   = 7 // 连接被 KILL，等待被打断
 )
 
 var eng = NewEngine()
@@ -88,6 +94,8 @@ func rcOf(err error, dupIdx *C.int) C.int {
 		return rcDeadlock
 	case errors.Is(err, ErrLockTimeout):
 		return rcTimeout
+	case errors.Is(err, ErrKilled):
+		return rcKilled
 	}
 	return rcNotFound
 }
@@ -148,6 +156,18 @@ func MyEngine_TxnBegin(iso C.int) C.ulonglong {
 
 //export MyEngine_TxnStmtBegin
 func MyEngine_TxnStmtBegin(h C.ulonglong, iso C.int) { txnOf(h).StmtBegin(int(iso)) }
+
+// TxnStmtEnd 标记一条顶层语句结束（hton 的 commit/rollback 钩子 all=false 时调用）。
+//
+//export MyEngine_TxnStmtEnd
+func MyEngine_TxnStmtEnd(h C.ulonglong) { txnOf(h).StmtEnd() }
+
+// TxnSetKill 设置连接被 KILL 的检查：fn 是 C++ 的函数指针（内部调用 thd_killed），thd 是连接。
+//
+//export MyEngine_TxnSetKill
+func MyEngine_TxnSetKill(h C.ulonglong, fn, thd unsafe.Pointer) {
+	txnOf(h).SetKillCheck(func() bool { return C.call_kill_fn(fn, thd) != 0 })
+}
 
 // TxnEnd 结束事务并释放句柄：commit != 0 提交，否则回滚。
 //

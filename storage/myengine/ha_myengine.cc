@@ -22,7 +22,7 @@ static const bool g_trace = getenv("MYENGINE_TRACE") != nullptr;
   do { if (g_trace) fprintf(stderr, "[myengine] %s " fmt "\n", __func__, ##__VA_ARGS__); } while (0)
 
 // Go 端返回码
-enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_DEADLOCK = 5, RC_TIMEOUT = 6 };
+enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_DEADLOCK = 5, RC_TIMEOUT = 6, RC_KILLED = 7 };
 // 行锁模式
 enum { LOCK_NONE = 0, LOCK_S = 1, LOCK_X = 2 };
 // Go 端 seek 模式
@@ -43,6 +43,8 @@ static inline bool in_multi_stmt_txn(THD *thd) {
 
 // ---------------------------------------------------------------- 事务钩子
 
+// 每条顶层语句结束时 MySQL 都会调用 commit/rollback（all=false），不论成功与否、是否在多语句事务里。
+// 用它来标记"语句结束"：之后的 external_lock/start_stmt 才算新语句（见 Txn.StmtBegin）。
 static int myengine_commit(handlerton *, THD *thd, bool all) {
   unsigned long long h = trx_of(thd);
   if (!h) return 0;
@@ -50,6 +52,8 @@ static int myengine_commit(handlerton *, THD *thd, bool all) {
     TRACE("commit all=%d", (int)all);
     MyEngine_TxnEnd(h, 1);
     set_trx(thd, 0);
+  } else {
+    MyEngine_TxnStmtEnd(h);  // 多语句事务里一条语句成功结束：事务继续，undo 留着
   }
   return 0;
 }
@@ -64,9 +68,13 @@ static int myengine_rollback(handlerton *, THD *thd, bool all) {
   } else {
     TRACE("rollback statement");
     MyEngine_TxnRollbackStmt(h);  // 多语句事务里只撤销当前语句
+    MyEngine_TxnStmtEnd(h);
   }
   return 0;
 }
+
+// 供 Go 端的锁等待轮询调用：连接是否被 KILL。
+static int myengine_killed(void *thd) { return thd_killed(thd); }
 
 static int myengine_close_connection(handlerton *, THD *thd) {
   unsigned long long h = trx_of(thd);
@@ -260,6 +268,9 @@ int ha_myengine::map_rc(int rc, int not_found_code) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);  // 与 InnoDB 一致：死锁时整个事务回滚
       return HA_ERR_LOCK_DEADLOCK;
     case RC_TIMEOUT: return HA_ERR_LOCK_WAIT_TIMEOUT;
+    case RC_KILLED:  // 与 InnoDB 一致：设置 kill 状态（客户端收到 1317），返回通用错误
+      thd_set_kill_status(ha_thd());
+      return HA_ERR_GENERIC;
     default: return not_found_code;
   }
 }
@@ -547,6 +558,7 @@ int ha_myengine::begin_stmt(THD *thd) {
   unsigned long long h = trx_of(thd);
   if (!h) {
     h = MyEngine_TxnBegin(iso);
+    MyEngine_TxnSetKill(h, (void *)myengine_killed, thd);
     set_trx(thd, h);
   }
   MyEngine_TxnStmtBegin(h, iso);

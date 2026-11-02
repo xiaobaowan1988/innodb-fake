@@ -423,6 +423,55 @@ def gap_own_gap_does_not_block_self(c):
     c.run("A", "BEGIN"); c.run("A", "SELECT * FROM g WHERE id BETWEEN 15 AND 35 FOR UPDATE")
     c.run("A", "INSERT INTO g VALUES (25,0)"); c.run("A", "COMMIT"); c.run("A", "SELECT * FROM g ORDER BY id")
 
+# ------------------------------------------------------------------ 语句原子性（触发器）与 KILL
+def _trigger_tables(c):
+    c.conn("A")
+    for t in ("m", "au", "m2", "au2"): c._exec("A", f"DROP TABLE IF EXISTS {t}")
+    for sql in ["CREATE TABLE m (id INT PRIMARY KEY, v INT) ENGINE=__E__",
+                "CREATE TABLE au (n INT AUTO_INCREMENT PRIMARY KEY, id INT) ENGINE=__E__",
+                "CREATE TRIGGER trg_m AFTER INSERT ON m FOR EACH ROW INSERT INTO au (id) VALUES (NEW.id)",
+                "CREATE TABLE m2 (id INT PRIMARY KEY, v INT) ENGINE=__E__",
+                "CREATE TABLE au2 (id INT PRIMARY KEY) ENGINE=__E__",
+                # 每次 UPDATE 一行就往 au2 插一行固定主键 1：第二行必然因重复而在触发器内部失败
+                "CREATE TRIGGER trg_m2 AFTER UPDATE ON m2 FOR EACH ROW INSERT INTO au2 VALUES (1)",
+                "INSERT INTO m VALUES (1,0)", "INSERT INTO m2 VALUES (1,0),(2,0),(3,0)"]:
+        c._exec("A", sql)
+
+@scenario
+def trigger_statement_atomicity(c):
+    _trigger_tables(c)
+    c.run("A", "BEGIN")
+    c.run("A", "INSERT INTO m VALUES (5,0)")                       # 前一条语句：成功，必须保留
+    c.run("A", "INSERT INTO m VALUES (20,0),(21,0),(1,0)")          # 触发器已往 au 写过 20、21，最后一行重复：整条语句撤销
+    c.run("A", "SELECT id FROM m ORDER BY id"); c.run("A", "SELECT id FROM au ORDER BY n")
+    c.run("A", "INSERT INTO m VALUES (30,0)")                       # 失败之后事务继续可用
+    c.run("A", "COMMIT")
+    c.run("A", "SELECT id FROM m ORDER BY id"); c.run("A", "SELECT id FROM au ORDER BY n")
+
+@scenario
+def trigger_inner_failure_rolls_back_whole_statement(c):
+    _trigger_tables(c)
+    c.run("A", "BEGIN")
+    c.run("A", "UPDATE m2 SET v=1 WHERE id=1")                      # 成功：触发器写入 au2(1)
+    c.run("A", "DELETE FROM au2")                                   # 清掉，让下一条语句从头开始
+    c.run("A", "UPDATE m2 SET v=9")                                 # 3 行；第 2 行的触发器重复主键而失败：整条 UPDATE 撤销
+    c.run("A", "SELECT id, v FROM m2 ORDER BY id"); c.run("A", "SELECT id FROM au2")
+    c.run("A", "COMMIT")
+    c.run("A", "SELECT id, v FROM m2 ORDER BY id"); c.run("A", "SELECT id FROM au2")
+
+@scenario
+def kill_query_interrupts_lock_wait(c):
+    c.conn("A"); c.conn("B"); c.conn("K")
+    c.run("A", "BEGIN"); c.run("A", "UPDATE t SET v=100 WHERE id=1")
+    cid = c._exec("B", "SELECT CONNECTION_ID()")[1][0][0]
+    h = c.start("B", "UPDATE t SET v=200 WHERE id=1"); c.blocked(h)
+    t0 = time.time(); c._exec("K", f"KILL QUERY {cid}")
+    r = c.join(h, timeout=10)
+    c.log.append(f"B: after KILL QUERY -> {fmt(r)} returned_within_3s={time.time()-t0 < 3}")
+    c.run("A", "COMMIT")
+    c.run("B", "SELECT v FROM t WHERE id=1")                        # 被杀的只是那条语句，连接和 A 的提交都不受影响
+    c.run("B", "UPDATE t SET v=300 WHERE id=1"); c.run("B", "SELECT v FROM t WHERE id=1")
+
 NEEDS_TIMEOUT = {"lock_wait_timeout"}
 
 def run_one(a, name, eng):

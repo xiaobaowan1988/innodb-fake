@@ -281,6 +281,8 @@ func TestGapRepeatableCountStaysStable(t *testing.T) {
 	if !blocked(ch) {
 		t.Fatal("insert must block")
 	}
+	a.StmtEnd()
+	a.StmtEnd()
 	a.StmtBegin(isoRepeatableRead)
 	n2 := len(lockedRangeRead(t, e, a, tb, 15, 45, lockX))
 	if n1 != n2 || n1 != 3 {
