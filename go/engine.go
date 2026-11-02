@@ -65,8 +65,9 @@ type rowHead struct{ head *rowVer }
 
 type table struct {
 	name string
-	pri  *BTree   // 主键编码 -> *rowHead
-	sec  []*BTree // 下标 = 索引号，[0] 不用；条目键 = 二级索引键 + 主键，值为 nil
+	pri  *BTree      // 主键编码 -> *rowHead
+	sec  []*BTree    // 下标 = 索引号，[0] 不用；条目键 = 二级索引键 + 主键，值为 nil
+	ix   []*idxState // 下标 = 索引号（含 0），每个索引的间隙锁状态
 
 	amu      sync.Mutex
 	auto     uint64
@@ -76,8 +77,12 @@ type table struct {
 func newTable(name string, nidx int) *table {
 	t := &table{name: name, pri: NewBTree()}
 	t.sec = make([]*BTree, nidx)
-	for i := 1; i < nidx; i++ {
-		t.sec[i] = NewBTree()
+	t.ix = make([]*idxState, nidx)
+	for i := 0; i < nidx; i++ {
+		t.ix[i] = &idxState{}
+		if i > 0 {
+			t.sec[i] = NewBTree()
+		}
 	}
 	return t
 }
@@ -120,6 +125,8 @@ type Txn struct {
 	undo     []undoRec
 	stmtBeg  int
 	done     bool
+	doneCh   chan struct{}            // 事务结束时关闭（供"等待事务结束"的等待者）
+	gaps     map[*idxState][]*gapLock // 本事务登记的间隙锁（仅所有者访问）
 
 	// 以下两个字段由 lm.mu 保护
 	held      map[lockKey]struct{}
@@ -206,7 +213,7 @@ func (e *Engine) Count(tb *table) int {
 // ---------------------------------------------------------------- 事务
 
 func (e *Engine) Begin(iso int) *Txn {
-	t := &Txn{e: e, iso: iso, timeout: e.LockTimeout, held: map[lockKey]struct{}{}}
+	t := &Txn{e: e, iso: iso, timeout: e.LockTimeout, held: map[lockKey]struct{}{}, doneCh: make(chan struct{})}
 	t.viewSnap.Store(-1)
 	e.tmu.Lock()
 	e.nextID++
@@ -279,6 +286,8 @@ func (e *Engine) Commit(t *Txn) {
 	}
 	t.undo = nil
 	e.lm.releaseAll(t) // 先标记提交再放锁，等待者醒来就能看到已提交的版本
+	t.releaseGaps()
+	close(t.doneCh)
 }
 
 func (e *Engine) Rollback(t *Txn) {
@@ -293,6 +302,8 @@ func (e *Engine) Rollback(t *Txn) {
 	delete(e.active, t)
 	e.tmu.Unlock()
 	e.lm.releaseAll(t)
+	t.releaseGaps()
+	close(t.doneCh)
 }
 
 // RollbackStmt 只撤销当前语句的修改，行锁保留（与 InnoDB 一致）。
@@ -599,7 +610,19 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 			}
 			continue
 		}
+		// 插入意向：新条目落在别的事务的间隙锁里就必须等它结束；检查和发布在同一把 gapMu 读锁内完成
+		entries := newEntries(tb, pk, h != nil, sec)
+		unlockIdx := tb.lockIdxForPublish(entries)
+		if holder := tb.gapHolder(t, entries); holder != nil {
+			unlockIdx()
+			e.mu.Unlock()
+			if err := e.lm.waitTxn(t, holder); err != nil {
+				return err
+			}
+			continue
+		}
 		e.pushVersion(t, tb, pk, h, &rowVer{trx: t, data: append([]byte(nil), row...), sec: copySec(sec)})
+		unlockIdx()
 		e.mu.Unlock()
 		return nil
 	}
@@ -643,6 +666,22 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 			}
 			continue
 		}
+		// 插入意向：主键不变时只有"新出现的二级索引条目"算插入；主键变了则新主键和它的二级索引条目都算
+		var entries []gapEntry
+		if same {
+			entries = newEntries(tb, oldpk, true, sec)
+		} else {
+			entries = newEntries(tb, newpk, nh != nil, sec)
+		}
+		unlockIdx := tb.lockIdxForPublish(entries)
+		if holder := tb.gapHolder(t, entries); holder != nil {
+			unlockIdx()
+			e.mu.Unlock()
+			if err := e.lm.waitTxn(t, holder); err != nil {
+				return err
+			}
+			continue
+		}
 		nv := &rowVer{trx: t, data: append([]byte(nil), row...), sec: copySec(sec)}
 		if same {
 			e.pushVersion(t, tb, oldpk, oh, nv)
@@ -650,6 +689,7 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 			e.pushVersion(t, tb, oldpk, oh, &rowVer{trx: t, deleted: true})
 			e.pushVersion(t, tb, newpk, nh, nv)
 		}
+		unlockIdx()
 		e.mu.Unlock()
 		return nil
 	}
@@ -707,10 +747,19 @@ type Cursor struct {
 	lock    int
 	pkWidth int // 主键编码宽度；二级索引条目末尾的 pkWidth 字节就是主键
 	raw     rawCursor
+	ix      *idxState
+
+	// 扫描边界（见 gap.go）
+	bKind      int // 外部设置的边界（SetBound）
+	bKey       []byte
+	bIncl      bool
+	bUniq      bool   // 外部终点边界是"唯一索引的全键"：扫到恰好等于终点的记录就结束（InnoDB 的做法）
+	done       bool   // 已命中唯一终点，下一次 Step 直接返回结束
+	autoPrefix []byte // Seek 在精确/前缀模式下自动设置的同键前缀边界；下一次非精确 Seek 会清掉，不影响外部边界
 }
 
 func (e *Engine) OpenCursor(t *Txn, tb *table, idx, lock, pkWidth int) *Cursor {
-	return &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}}
+	return &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx]}
 }
 
 func (c *Cursor) pk() []byte {
@@ -763,32 +812,69 @@ func (c *Cursor) currentRow(pk []byte) ([]byte, bool) {
 	return h.head.data, true
 }
 
-// Seek 定位并返回第一个符合条件的行；Step 沿 dir 方向取下一行。
-func (c *Cursor) Seek(key []byte, mode int) ([]byte, error) { return c.advance(true, key, mode, 0) }
-func (c *Cursor) Step(dir int) ([]byte, error)              { return c.advance(false, nil, 0, dir) }
+// 唯一索引全键等值（flags 位）：命中且行存在时只加记录锁，不登记间隙。
+const seekUniqueFull = 1
 
-func (c *Cursor) advance(isSeek bool, key []byte, mode, dir int) ([]byte, error) {
+// Seek 定位并返回第一个符合条件的行；Step 沿 dir 方向取下一行。
+func (c *Cursor) Seek(key []byte, mode int) ([]byte, error) { return c.advance(true, key, mode, 0, 0) }
+func (c *Cursor) SeekFlags(key []byte, mode, flags int) ([]byte, error) {
+	return c.advance(true, key, mode, 0, flags)
+}
+func (c *Cursor) Step(dir int) ([]byte, error) { return c.advance(false, nil, 0, dir, 0) }
+
+func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte, error) {
 	e := c.e
-	var prefix []byte
+	gap := c.gapMode()
+	firstUniq := false
 	if isSeek {
 		dir = seekDir(mode)
 		if seekNeedsPrefix(mode) {
-			prefix = append([]byte(nil), key...)
+			// 同键扫描：之后的 Step（index_next_same）遇到不再匹配的条目就停止
+			c.autoPrefix = append([]byte(nil), key...)
+		} else {
+			c.autoPrefix = nil
 		}
+		// 唯一索引全键：精确查找，或范围以 >= K 开始（K 恰好存在时都只加记录锁，不锁它前面的间隙）
+		firstUniq = flags&seekUniqueFull != 0 && (mode == seekExact || mode == seekGE)
+		c.done = false
+	} else if c.done {
+		c.raw.valid = false
+		return nil, ErrNotFound
 	}
 	for {
 		e.mu.RLock()
+		if gap {
+			c.ix.gapMu.Lock()
+		}
 		var ok bool
+		isFirstPos := isSeek // 本次是不是扫描的起点（反向扫描的起点要多锁一段）
 		if isSeek {
-			ok = c.raw.seek(key, mode)
+			// 精确/前缀模式在内部用 GE/LE 定位：未命中时也要保留"第一个 >= 查找键"的候选，
+			// 才能登记它前面的间隙；是否命中由前缀边界（beyond）判断，效果与原来等价。
+			rawMode := mode
+			switch mode {
+			case seekExact:
+				rawMode = seekGE
+			case seekPrefixLast:
+				rawMode = seekLE
+			}
+			ok = c.raw.seek(key, rawMode)
 			isSeek = false
 		} else {
 			ok = c.raw.step(dir)
 		}
-		if ok && prefix != nil && !bytes.HasPrefix(c.raw.key, prefix) {
-			c.raw.valid, ok = false, false
+		inRange := ok && !c.beyond(c.raw.key)                          // 候选存在且没有越过扫描边界
+		hit := firstUniq && inRange && bytes.HasPrefix(c.raw.key, key) // 唯一全键恰好命中
+		if gap {
+			// 唯一全键等值命中：先不登记间隙，等拿到行锁确认行存在后才算（命中且存在 = 只有记录锁）。
+			// 其余情形：候选在范围内 = next-key（登记它前面的间隙，行锁随后加）；越界/索引末尾 = 只登记间隙，不锁该行。
+			if !hit {
+				c.registerGap(dir, ok, isFirstPos)
+			}
+			c.ix.gapMu.Unlock()
 		}
-		if !ok {
+		if !inRange {
+			c.raw.valid = false
 			e.mu.RUnlock()
 			return nil, ErrNotFound
 		}
@@ -796,11 +882,13 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir int) ([]byte, error)
 			row, ok := c.snapshotRow()
 			e.mu.RUnlock()
 			if ok {
+				c.noteReturned()
 				return row, nil
 			}
 			continue
 		}
 		pk := c.pk()
+		deadKey := c.raw.key
 		e.mu.RUnlock()
 		// 加锁读：先放掉 e.mu 再等行锁；醒来后树可能变了，游标会按 key 重新定位
 		if err := e.lm.lock(c.t, c.tbl, pk, c.lock); err != nil {
@@ -810,8 +898,20 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir int) ([]byte, error)
 		row, ok2 := c.currentRow(pk)
 		e.mu.RUnlock()
 		if ok2 {
+			c.noteReturned()
 			return row, nil
 		}
+		if hit && gap {
+			// 唯一键命中的那一行其实已被删除：按"未命中"处理，补登记它前面的间隙，之后按普通同键扫描继续
+			e.mu.RLock()
+			c.ix.gapMu.Lock()
+			if c.raw.seek(deadKey, seekGE) && bytes.Equal(c.raw.key, deadKey) {
+				c.registerGap(1, true, false)
+			}
+			c.ix.gapMu.Unlock()
+			e.mu.RUnlock()
+		}
+		firstUniq = false
 	}
 }
 
@@ -963,4 +1063,30 @@ func (e *Engine) LastLatest(tb *table, idx, pkWidth int) ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+// RecordsInRange 估算索引 idx 上落在 [lo, hi] 内的条目数（最多数 limit 个）。lo/hi 可以是键的前缀。
+// 只用于优化器估算：不区分可见性，包含已删除/未提交的条目。
+func (e *Engine) RecordsInRange(tb *table, idx int, lo []byte, hasLo, loIncl bool, hi []byte, hasHi, hiIncl bool, limit int) (n int, truncated bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	c := &Cursor{e: e, tbl: tb, idx: idx, raw: rawCursor{t: tb.tree(idx)}}
+	var ok bool
+	switch {
+	case !hasLo:
+		ok = c.raw.seek(nil, seekFirst)
+	case loIncl:
+		ok = c.raw.seek(lo, seekGE)
+	default:
+		ok = c.raw.seek(lo, seekAfter)
+	}
+	if hasHi {
+		c.SetBound(boundEndFwd, hi, hiIncl)
+	}
+	for ; ok && !c.beyond(c.raw.key); ok = c.raw.step(1) {
+		if n++; n >= limit {
+			return n, true
+		}
+	}
+	return n, false
 }

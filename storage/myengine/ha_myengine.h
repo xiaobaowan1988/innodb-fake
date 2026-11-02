@@ -42,7 +42,9 @@ class ha_myengine : public handler {
   int begin_stmt(THD *thd);
   int map_rc(int rc, int not_found_code);
   int step(uchar *buf, int dir);
-  int seek_fetch(uchar *buf, const void *key, size_t klen, int mode);
+  int seek_fetch(uchar *buf, const void *key, size_t klen, int mode, int flags = 0);
+  void apply_end_bound(int dir);
+  void encode_range_key(uint idx, const key_range *kr, std::string &out);
   void init_auto_inc();
 
  public:
@@ -88,6 +90,7 @@ class ha_myengine : public handler {
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
 
+  ha_rows records_in_range(uint inx, key_range *min_key, key_range *max_key) override;
   int info(uint flag) override;
   int external_lock(THD *thd, int lock_type) override;
   int start_stmt(THD *thd, thr_lock_type lock_type) override;

@@ -47,11 +47,16 @@ def fmt(r): return r[0] + ":" + str(r[1])
 def fresh(c, ddl_extra=""):
     cur = pymysql.connect(unix_socket=c.a.socket, user="root", autocommit=True).cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS {c.db}"); cur.execute(f"USE {c.db}")
-    for t in ("t", "u", "ai"): cur.execute(f"DROP TABLE IF EXISTS {t}")
+    for t in ("t", "u", "ai", "g", "gu"): cur.execute(f"DROP TABLE IF EXISTS {t}")
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, k INT, KEY(k)) ENGINE=__E__".replace("__E__", c.eng))
     cur.execute("INSERT INTO t VALUES (1,10,1),(2,20,2),(3,30,3)")
     cur.execute("CREATE TABLE u (id INT PRIMARY KEY, e INT, UNIQUE KEY ue(e)) ENGINE=__E__".replace("__E__", c.eng))
     cur.execute("CREATE TABLE ai (id INT AUTO_INCREMENT PRIMARY KEY, v INT) ENGINE=__E__".replace("__E__", c.eng))
+    # 间隙锁场景用表：id = 10,20,30,40,50；k = id/10，k 上有非唯一二级索引
+    cur.execute("CREATE TABLE g (id INT PRIMARY KEY, k INT, KEY(k)) ENGINE=__E__".replace("__E__", c.eng))
+    cur.execute("INSERT INTO g VALUES (10,1),(20,2),(30,3),(40,4),(50,5)")
+    cur.execute("CREATE TABLE gu (id INT PRIMARY KEY, e INT, UNIQUE KEY ue(e)) ENGINE=__E__".replace("__E__", c.eng))
+    cur.execute("INSERT INTO gu VALUES (10,1),(20,2),(30,3),(40,4),(50,5)")
 
 SC = {}
 def scenario(f): SC[f.__name__] = f; return f
@@ -247,6 +252,176 @@ def lock_wait_timeout(c):  # 需要 --timeout-tests
     c.log.append(f"B: waited_about_2s={1.5 < time.time()-t0 < 4.0}")
     c.run("B", "SELECT v FROM t WHERE id=3")                            # 事务还活着，只有这条语句回滚
     c.run("B", "COMMIT"); c.run("A", "ROLLBACK"); c.run("A", ALL)
+
+# ------------------------------------------------------------------ 间隙锁（RR / SERIALIZABLE 加锁读）
+def gap_case(c, setup, probes, iso=None):
+    """A 在事务里执行 setup（加锁读/写），然后每个 probe 在各自的自动提交会话里异步执行，
+    记录是否被阻塞；最后 A 提交，所有被阻塞的 probe 应当随之完成。"""
+    c.conn("A", iso)
+    c.run("A", "BEGIN")
+    for q in setup: c.run("A", q)
+    hs = []
+    for i, q in enumerate(probes):
+        name = f"B{i}"; c.conn(name); h = c.start(name, q); c.blocked(h); hs.append(h)
+    c.run("A", "COMMIT")
+    for h in hs: c.join(h)
+    c.run("A", "SELECT * FROM g ORDER BY id")
+
+@scenario
+def gap_range_for_update(c):
+    gap_case(c, ["SELECT * FROM g WHERE id BETWEEN 15 AND 35 FOR UPDATE"],
+             ["INSERT INTO g VALUES (5,0)", "INSERT INTO g VALUES (12,0)", "INSERT INTO g VALUES (25,0)",
+              "INSERT INTO g VALUES (35,0)", "INSERT INTO g VALUES (38,0)", "INSERT INTO g VALUES (45,0)", "INSERT INTO g VALUES (60,0)",
+              "UPDATE g SET k=9 WHERE id=40", "UPDATE g SET k=9 WHERE id=10"])   # 正向停止记录 40：只锁间隙，不锁行
+
+@scenario
+def gap_unique_miss(c):
+    gap_case(c, ["SELECT * FROM g WHERE id = 25 FOR UPDATE"],
+             ["INSERT INTO g VALUES (22,0)", "INSERT INTO g VALUES (28,0)", "INSERT INTO g VALUES (35,0)",
+              "UPDATE g SET k=9 WHERE id=30", "UPDATE g SET k=9 WHERE id=20"])
+
+@scenario
+def gap_unique_hit(c):
+    gap_case(c, ["SELECT * FROM g WHERE id = 30 FOR UPDATE"],
+             ["INSERT INTO g VALUES (25,0)", "INSERT INTO g VALUES (35,0)", "UPDATE g SET k=9 WHERE id=30", "UPDATE g SET k=9 WHERE id=20"])
+
+@scenario
+def gap_secondary_equality(c):
+    gap_case(c, ["SELECT * FROM g WHERE k = 2 FOR UPDATE"],
+             ["INSERT INTO g VALUES (21,2)", "INSERT INTO g VALUES (15,2)", "INSERT INTO g VALUES (35,3)",
+              "INSERT INTO g VALUES (5,1)", "UPDATE g SET k=2 WHERE id=40", "INSERT INTO g VALUES (22,9)"])
+
+@scenario
+def gap_secondary_miss(c):
+    gap_case(c, ["SELECT * FROM g WHERE k = 99 FOR UPDATE"],
+             ["INSERT INTO g VALUES (60,99)", "INSERT INTO g VALUES (61,6)", "INSERT INTO g VALUES (9,0)"])
+
+@scenario
+def gap_full_scan_delete(c):
+    gap_case(c, ["DELETE FROM g WHERE id + 0 > 1000"],
+             ["INSERT INTO g VALUES (5,0)", "INSERT INTO g VALUES (45,0)", "INSERT INTO g VALUES (60,0)"])
+
+@scenario
+def gap_supremum(c):
+    gap_case(c, ["SELECT * FROM g WHERE id > 40 FOR UPDATE"],
+             ["INSERT INTO g VALUES (35,0)", "INSERT INTO g VALUES (45,0)", "INSERT INTO g VALUES (60,0)"])
+
+@scenario
+def gap_read_committed_no_gap_locks(c):
+    gap_case(c, ["SELECT * FROM g WHERE id BETWEEN 15 AND 35 FOR UPDATE"],
+             ["INSERT INTO g VALUES (12,0)", "INSERT INTO g VALUES (25,0)"], iso="READ COMMITTED")
+
+@scenario
+def gap_serializable_plain_select(c):
+    gap_case(c, ["SELECT * FROM g WHERE id BETWEEN 15 AND 35"],
+             ["INSERT INTO g VALUES (25,0)", "INSERT INTO g VALUES (45,0)"], iso="SERIALIZABLE")
+
+@scenario
+def gap_update_range(c):
+    gap_case(c, ["UPDATE g SET k = k WHERE id BETWEEN 15 AND 35"],
+             ["INSERT INTO g VALUES (25,0)", "INSERT INTO g VALUES (45,0)", "INSERT INTO g VALUES (12,0)"])
+
+@scenario
+def gap_backward_scan(c):
+    gap_case(c, ["SELECT * FROM g WHERE id >= 30 ORDER BY id DESC FOR UPDATE"],
+             ["INSERT INTO g VALUES (60,0)", "INSERT INTO g VALUES (45,0)", "INSERT INTO g VALUES (35,0)",
+              "INSERT INTO g VALUES (25,0)", "INSERT INTO g VALUES (15,0)", "INSERT INTO g VALUES (5,0)",
+              "UPDATE g SET k=9 WHERE id=20", "UPDATE g SET k=9 WHERE id=10"])   # 反向停止记录 20：行和它前面的间隙都被锁
+
+@scenario
+def gap_backward_range(c):
+    gap_case(c, ["SELECT * FROM g WHERE id BETWEEN 25 AND 45 ORDER BY id DESC FOR UPDATE"],
+             ["INSERT INTO g VALUES (22,0)", "INSERT INTO g VALUES (15,0)", "INSERT INTO g VALUES (47,0)",
+              "INSERT INTO g VALUES (55,0)", "UPDATE g SET k=9 WHERE id=20", "UPDATE g SET k=9 WHERE id=50"])
+
+@scenario
+def gap_limit(c):
+    gap_case(c, ["SELECT * FROM g ORDER BY id LIMIT 2 FOR UPDATE"],
+             ["INSERT INTO g VALUES (5,0)", "INSERT INTO g VALUES (15,0)", "INSERT INTO g VALUES (25,0)"])
+
+@scenario
+def gap_secondary_range(c):
+    gap_case(c, ["SELECT * FROM g WHERE k BETWEEN 2 AND 3 FOR UPDATE"],
+             ["INSERT INTO g VALUES (25,2)", "INSERT INTO g VALUES (35,3)", "INSERT INTO g VALUES (36,4)", "INSERT INTO g VALUES (5,1)",
+              "INSERT INTO g VALUES (15,2)", "UPDATE g SET k=9 WHERE id=10", "UPDATE g SET k=2 WHERE id=50"])
+    # 已知差异（不在回归里）：InnoDB 还会锁二级索引停止条目的记录部分，"UPDATE g SET k=9 WHERE id=40" 在 InnoDB 下被阻塞，
+    # 本引擎不阻塞——见 docs/plan-gap-latch.md v3 第 5 条
+
+@scenario
+def gap_delete_range(c):
+    gap_case(c, ["DELETE FROM g WHERE id BETWEEN 20 AND 30"],
+             ["INSERT INTO g VALUES (25,0)", "INSERT INTO g VALUES (15,0)", "INSERT INTO g VALUES (35,0)", "INSERT INTO g VALUES (45,0)"])
+
+@scenario
+def gap_for_share_range(c):
+    gap_case(c, ["SELECT * FROM g WHERE id BETWEEN 15 AND 35 FOR SHARE"],
+             ["INSERT INTO g VALUES (25,0)", "INSERT INTO g VALUES (45,0)", "UPDATE g SET k=9 WHERE id=20"])
+
+@scenario
+def gap_unique_secondary_hit(c):
+    c.conn("A"); c.run("A", "BEGIN"); c.run("A", "SELECT * FROM gu WHERE e = 3 FOR UPDATE")
+    hs = []
+    for i, q in enumerate(["INSERT INTO gu VALUES (35,35)", "INSERT INTO gu VALUES (25,25)", "UPDATE gu SET e=99 WHERE id=30", "UPDATE gu SET e=98 WHERE id=20"]):
+        c.conn(f"B{i}"); h = c.start(f"B{i}", q); c.blocked(h); hs.append(h)
+    c.run("A", "COMMIT")
+    for h in hs: c.join(h)
+
+@scenario
+def gap_unique_secondary_miss(c):
+    c.conn("A"); c.run("A", "BEGIN"); c.run("A", "SELECT * FROM gu WHERE e = 25 FOR UPDATE")
+    hs = []
+    for i, q in enumerate(["INSERT INTO gu VALUES (1,22)", "INSERT INTO gu VALUES (2,35)", "UPDATE gu SET e=99 WHERE id=30", "UPDATE gu SET e=24 WHERE id=50"]):
+        c.conn(f"B{i}"); h = c.start(f"B{i}", q); c.blocked(h); hs.append(h)
+    c.run("A", "COMMIT")
+    for h in hs: c.join(h)
+
+# 范围的起点/终点是否恰好等于已有记录，对锁的范围有影响（InnoDB 的"唯一全键"规则）。用实测对照表固化。
+def _bounds_case(name, sql):
+    def f(c):
+        gap_case(c, [sql], ["INSERT INTO g VALUES (15,0)", "INSERT INTO g VALUES (25,0)",
+                            "INSERT INTO g VALUES (35,0)", "INSERT INTO g VALUES (45,0)"])
+    f.__name__ = name
+    scenario(f)
+for _n, _q in [
+    ("gap_bounds_20_35_start_exists",   "SELECT * FROM g WHERE id BETWEEN 20 AND 35 FOR UPDATE"),
+    ("gap_bounds_15_30_end_exists",     "SELECT * FROM g WHERE id BETWEEN 15 AND 30 FOR UPDATE"),
+    ("gap_bounds_20_30_both_exist",     "SELECT * FROM g WHERE id BETWEEN 20 AND 30 FOR UPDATE"),
+    ("gap_bounds_gt20_le30",            "SELECT * FROM g WHERE id > 20 AND id <= 30 FOR UPDATE"),
+    ("gap_bounds_ge20_lt30",            "SELECT * FROM g WHERE id >= 20 AND id < 30 FOR UPDATE"),
+    ("gap_bounds_ge20_no_end",          "SELECT * FROM g WHERE id >= 20 FOR UPDATE"),
+    ("gap_bounds_le30_no_start",        "SELECT * FROM g WHERE id <= 30 FOR UPDATE"),
+    ("gap_bounds_ge25_start_missing",   "SELECT * FROM g WHERE id >= 25 FOR UPDATE"),
+    ("gap_bounds_delete_20_30",         "DELETE FROM g WHERE id BETWEEN 20 AND 30"),
+    ("gap_bounds_update_20_30",         "UPDATE g SET k=k WHERE id BETWEEN 20 AND 30"),
+]:
+    _bounds_case(_n, _q)
+
+@scenario
+def gap_phantom_prevented(c):
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "SELECT COUNT(*) FROM g WHERE id >= 15 FOR UPDATE")
+    h = c.start("B", "INSERT INTO g VALUES (25,0)"); c.blocked(h)
+    c.run("A", "SELECT COUNT(*) FROM g WHERE id >= 15 FOR UPDATE")      # 仍是 4，没有幻读
+    c.run("A", "COMMIT"); c.join(h)
+    c.run("A", "SELECT COUNT(*) FROM g WHERE id >= 15")                  # 提交后才是 5
+
+@scenario
+def gap_classic_deadlock(c):
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "SELECT * FROM g WHERE id = 25 FOR UPDATE")
+    c.run("B", "BEGIN"); c.run("B", "SELECT * FROM g WHERE id = 25 FOR UPDATE")   # 间隙锁之间互不冲突
+    ha = c.start("A", "INSERT INTO g VALUES (25,0)"); c.blocked(ha)
+    rb = c._exec("B", "INSERT INTO g VALUES (26,0)")                                 # 形成环
+    ra = c.join(ha)
+    errs = [r for r in (ra, rb) if r[0] == "err"]
+    c.log.append(f"deadlock: errors={[e[1] for e in errs]} exactly_one_1213={len(errs)==1 and errs[0][1]==1213}")
+    for n in ("A", "B"): c._exec(n, "ROLLBACK")
+
+@scenario
+def gap_own_gap_does_not_block_self(c):
+    c.conn("A")
+    c.run("A", "BEGIN"); c.run("A", "SELECT * FROM g WHERE id BETWEEN 15 AND 35 FOR UPDATE")
+    c.run("A", "INSERT INTO g VALUES (25,0)"); c.run("A", "COMMIT"); c.run("A", "SELECT * FROM g ORDER BY id")
 
 NEEDS_TIMEOUT = {"lock_wait_timeout"}
 

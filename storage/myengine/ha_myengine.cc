@@ -361,10 +361,67 @@ int ha_myengine::step(uchar *buf, int dir) {
   return map_rc(MyEngine_CursorFetch(cur, dir, buf, table->s->reclength, &len), HA_ERR_END_OF_FILE);
 }
 
-int ha_myengine::seek_fetch(uchar *buf, const void *key, size_t klen, int mode) {
+int ha_myengine::seek_fetch(uchar *buf, const void *key, size_t klen, int mode, int flags) {
   size_t len = 0;
-  return map_rc(MyEngine_CursorSeekFetch(cur, const_cast<void *>(key), klen, mode, buf, table->s->reclength, &len),
+  return map_rc(MyEngine_CursorSeekFetch(cur, const_cast<void *>(key), klen, mode, flags, buf,
+                                         table->s->reclength, &len),
                 HA_ERR_END_OF_FILE);
+}
+
+// 把 MySQL 的 key_range（key 格式）编码成与存储一致的可比较键。
+void ha_myengine::encode_range_key(uint idx, const key_range *kr, std::string &out) {
+  KEY *ki = &table->key_info[idx];
+  uint nparts = std::min<uint>(__builtin_popcountll(kr->keypart_map), ki->user_defined_key_parts);
+  uint key_len = calculate_key_len(table, idx, kr->keypart_map);
+  if (key_scratch.size() < table->s->rec_buff_length) key_scratch.resize(table->s->rec_buff_length);
+  memset(key_scratch.data(), 0, key_scratch.size());
+  key_restore(key_scratch.data(), kr->key, ki, key_len);
+  key_for(idx, key_scratch.data(), nparts, out);
+}
+
+// 优化器估算范围内的行数。没有它优化器选不出 range/ref，只能全表扫描——而全表扫描在 RR 下会锁住所有间隙。
+// 至少返回 1（与 InnoDB 一致：估算为 0 时按 1 处理，避免被当成"不可能的范围"）。
+ha_rows ha_myengine::records_in_range(uint inx, key_range *min_key, key_range *max_key) {
+  std::string lo, hi;
+  int has_lo = 0, lo_incl = 1, has_hi = 0, hi_incl = 1;
+  if (min_key) {
+    encode_range_key(inx, min_key, lo);
+    has_lo = 1;
+    lo_incl = min_key->flag != HA_READ_AFTER_KEY;  // KEY_EXACT / KEY_OR_NEXT 含起点，AFTER_KEY 不含
+  }
+  if (max_key) {
+    encode_range_key(inx, max_key, hi);
+    has_hi = 1;
+    hi_incl = max_key->flag != HA_READ_BEFORE_KEY;  // AFTER_KEY 含终点，BEFORE_KEY 不含
+  }
+  long long n = MyEngine_RecordsInRange(tbl_h, inx, lo.data(), lo.size(), has_lo, lo_incl, hi.data(), hi.size(),
+                                        has_hi, hi_incl, 10000);
+  return n < 1 ? 1 : (ha_rows)n;
+}
+
+// 把 MySQL 的范围终点（handler::end_range）编码后告诉 Go 端游标：越过终点的第一个条目只让它前面的间隙被锁住，
+// 而不会锁它的行（InnoDB 的做法）。每次定位前都要调用，因为首个候选也可能已经越界。
+// dir: 本次定位的扫描方向（+1 正向 / -1 反向）。handler::range_scan_direction 是私有成员，所以由调用者按定位方式给出。
+void ha_myengine::apply_end_bound(int dir) {
+  if (!cur) return;
+  if (end_range == nullptr) {
+    MyEngine_CursorBound(cur, 0, nullptr, 0, 0, 0);
+    return;
+  }
+  KEY *ki = &table->key_info[active_index];
+  uint nparts = std::min<uint>(__builtin_popcountll(end_range->keypart_map), ki->user_defined_key_parts);
+  uint key_len = calculate_key_len(table, active_index, end_range->keypart_map);
+  if (key_scratch.size() < table->s->rec_buff_length) key_scratch.resize(table->s->rec_buff_length);
+  memset(key_scratch.data(), 0, key_scratch.size());
+  key_restore(key_scratch.data(), end_range->key, ki, key_len);
+  std::string k;
+  key_for(active_index, key_scratch.data(), nparts, k);
+  // 终点是唯一索引的全键（且不含 NULL）：扫到恰好等于终点的记录就结束，不再读后面的记录
+  int uniq = (nparts == ki->user_defined_key_parts && (ki->flags & HA_NOSAME) &&
+              !key_has_null(active_index, key_scratch.data()))
+                 ? 1
+                 : 0;
+  MyEngine_CursorBound(cur, dir > 0 ? 2 : 3, k.data(), k.size(), end_range->flag == HA_READ_AFTER_KEY ? 1 : 0, uniq);
 }
 
 int ha_myengine::rnd_init(bool scan) {
@@ -426,6 +483,7 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
     case HA_READ_PREFIX_LAST_OR_PREV: mode = SEEK_PREFIX_LAST; break;
     default: return HA_ERR_UNSUPPORTED;
   }
+  apply_end_bound(mode == SEEK_LE || mode == SEEK_LT || mode == SEEK_PREFIX_LAST ? -1 : 1);  // 先于定位：首个候选也可能已经越过范围终点
   // 把 key 格式还原进私有缓冲区（绝不能写 record[0]：INSERT ... ON DUPLICATE KEY UPDATE / REPLACE
   // 正是在 record[0] 里放着待插入的新行，同时让我们把已存在的行读到 record[1]），再编码成可比较键。
   KEY *ki = &table->key_info[active_index];
@@ -437,7 +495,12 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
   key_restore(key_scratch.data(), key, ki, key_len);
   std::string k;
   key_for(active_index, key_scratch.data(), nparts, k);
-  int e = seek_fetch(buf, k.data(), k.size(), mode);
+  // 唯一索引的全键（且不含 NULL）的等值查找或范围起点 >= K：K 恰好存在时只需要记录锁，不需要间隙锁
+  int flags = ((find_flag == HA_READ_KEY_EXACT || find_flag == HA_READ_KEY_OR_NEXT) && nparts == ki->user_defined_key_parts && (ki->flags & HA_NOSAME) &&
+               !key_has_null(active_index, key_scratch.data()))
+                  ? 1
+                  : 0;
+  int e = seek_fetch(buf, k.data(), k.size(), mode, flags);
   if (e == HA_ERR_END_OF_FILE && find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
     e = seek_fetch(buf, k.data(), k.size(), SEEK_LE);
   }
@@ -446,8 +509,16 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
 
 int ha_myengine::index_next(uchar *buf) { TRACE(""); return step(buf, 1); }
 int ha_myengine::index_prev(uchar *buf) { TRACE(""); return step(buf, -1); }
-int ha_myengine::index_first(uchar *buf) { TRACE(""); return seek_fetch(buf, nullptr, 0, SEEK_FIRST); }
-int ha_myengine::index_last(uchar *buf) { TRACE(""); return seek_fetch(buf, nullptr, 0, SEEK_LAST); }
+int ha_myengine::index_first(uchar *buf) {
+  TRACE("");
+  apply_end_bound(1);
+  return seek_fetch(buf, nullptr, 0, SEEK_FIRST);
+}
+int ha_myengine::index_last(uchar *buf) {
+  TRACE("");
+  apply_end_bound(-1);
+  return seek_fetch(buf, nullptr, 0, SEEK_LAST);
+}
 
 // ---------------------------------------------------------------- 统计、语句边界与锁
 

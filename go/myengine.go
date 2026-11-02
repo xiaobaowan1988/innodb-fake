@@ -240,15 +240,26 @@ func finishFetch(row []byte, err error, out unsafe.Pointer, capacity C.size_t, o
 }
 
 // CursorSeekFetch 定位并取一行整行；一次跨语言调用。
+// flags 位 0：唯一索引全键等值（命中且行存在时只加记录锁，不登记间隙锁）。
 //
 //export MyEngine_CursorSeekFetch
-func MyEngine_CursorSeekFetch(h C.ulonglong, key unsafe.Pointer, klen C.size_t, mode C.int, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
+func MyEngine_CursorSeekFetch(h C.ulonglong, key unsafe.Pointer, klen C.size_t, mode C.int, flags C.int, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
 	c := curOf(h)
 	if c == nil {
 		return rcNotFound
 	}
-	row, err := c.Seek(bytesOf(key, klen), int(mode))
+	row, err := c.SeekFlags(bytesOf(key, klen), int(mode), int(flags))
 	return finishFetch(row, err, out, capacity, outlen)
+}
+
+// CursorBound 设置扫描边界：kind 0 清除，1 同键前缀，2 正向终点，3 反向终点；unique 表示终点是唯一索引的全键。
+// 越过边界的第一个条目只会让它前面的间隙被锁住（RR/SERIALIZABLE 的加锁读），不会锁它的行。
+//
+//export MyEngine_CursorBound
+func MyEngine_CursorBound(h C.ulonglong, kind C.int, key unsafe.Pointer, klen C.size_t, inclusive C.int, unique C.int) {
+	if c := curOf(h); c != nil {
+		c.SetBoundU(int(kind), bytesOf(key, klen), inclusive != 0, unique != 0)
+	}
 }
 
 // CursorFetch 沿 step 方向(+1/-1)移动并取一行整行；一次跨语言调用。
@@ -292,6 +303,14 @@ func MyEngine_IndexLastLatest(tbh C.ulonglong, idx C.int, pkWidth C.int, out uns
 		return rcNotFound
 	}
 	return copyOut(row, out, capacity, outlen)
+}
+
+// RecordsInRange 估算范围内的条目数，供优化器选择执行计划；最多数 limit 个。
+//
+//export MyEngine_RecordsInRange
+func MyEngine_RecordsInRange(tbh C.ulonglong, idx C.int, lo unsafe.Pointer, lolen C.size_t, hasLo, loIncl C.int, hi unsafe.Pointer, hilen C.size_t, hasHi, hiIncl C.int, limit C.int) C.longlong {
+	n, _ := eng.RecordsInRange(tblOf(tbh), int(idx), bytesOf(lo, lolen), hasLo != 0, loIncl != 0, bytesOf(hi, hilen), hasHi != 0, hiIncl != 0, int(limit))
+	return C.longlong(n)
 }
 
 func main() {}
