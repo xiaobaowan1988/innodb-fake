@@ -95,7 +95,7 @@ func TestOverwriteAndEmpty(t *testing.T) {
 		t.Fatal("dup accepted")
 	}
 	tr.Put([]byte("a"), []byte("3"), true)
-	if v, _ := tr.Get([]byte("a")); !bytes.Equal(v, []byte("3")) || tr.Len() != 1 {
+	if v, _ := tr.Get([]byte("a")); !bytes.Equal(v.([]byte), []byte("3")) || tr.Len() != 1 {
 		t.Fatal("overwrite failed")
 	}
 	tr.Delete([]byte("a"))

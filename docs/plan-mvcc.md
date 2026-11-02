@@ -153,7 +153,7 @@ type ReadView struct{ snapTS uint64; me *Txn }
 4. **性能**：重跑 `bench.py`，记录 MVCC 的开销（预期点查略慢、写更慢）。
 
 ## 6. 阶段与完成标准
-- [ ] **P1 纯 Go 核心**：`engine.go` + 单测通过（含 `-race`）。
+- [x] **P1 纯 Go 核心**：`engine.go` + 单测通过（含 `-race`）。12 个测试；另做了 6 个变异检查（可见性恒真、二级索引不核对、死锁检测失效、不取加锁读、回滚不弹版本、purge 过度）均被测试抓到。
 - [ ] **P2 接入 MySQL**：cgo 层与 C++ handler 改造；`compare_innodb.sh` 仍 147 个结果集一致。
 - [ ] **P3 场景验证**：`txn_check.py` 全部与 InnoDB 一致；`concurrency_check.py` 四项异常数均为 0。
 - [ ] **P4 收尾**：性能重测、文档更新、限制清单。
@@ -166,3 +166,14 @@ type ReadView struct{ snapTS uint64; me *Txn }
 
 ## 变更记录
 - v1：初稿。
+- v2（P1 完成时）：实现中与初稿不同或初稿未写明的点——
+  1. **B+ 树在表打开时一次建好**：`Open(name, nkeys)` 传入索引个数，主索引和所有二级索引的树都已存在，
+     游标只需持有固定的树指针，读路径不再需要"不存在就创建"（因此去掉了 `treeRO/emptyTree`）。
+  2. **游标分两层**：`rawCursor` 只管"树里的位置"（沿叶子链走，树被改过则按 key 重新定位），不依赖事务；
+     `Cursor` 在其上叠加可见性、行锁、二级索引核对。
+  3. **跳过不可见候选时的方向与前缀规则**：`seekExact`/`seekPrefixLast` 下候选必须仍以查找键为前缀，否则视为没找到
+     （防止 EXACT 滑到邻居行）；`LE/LT/Last/PrefixLast` 向前（-1）找，其余向后（+1）。
+  4. **死锁检测的一个坑**：被唤醒但尚未重试的等待者，其 `blockedOn` 已过期，会让后续检测误判成环；
+     唤醒时必须清掉（`releaseAll` 里已处理）。
+  5. 主键被修改的 `Update` 在**应用之前**完成所有检查（新键占用、唯一冲突），失败时不留半截状态，与初稿一致。
+  6. 后台 purge 协程由 `StartPurger` 提供，P2 在加载库时启动。

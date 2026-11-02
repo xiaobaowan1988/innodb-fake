@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func newTbl() *table { return &table{trees: map[int]*BTree{}} }
+func newTree() *BTree { return NewBTree() }
 
 // 键 = 2 字节"前缀"部分 + 2 字节后缀，便于测试前缀匹配类模式。
 func k2(a, b int) []byte { return []byte{byte(a >> 8), byte(a), byte(b >> 8), byte(b)} }
@@ -24,15 +24,15 @@ func sortedKeys(m map[string]bool) [][]byte {
 // 所有 seek 模式（含前缀）对照暴力实现。
 func TestSeekModesAgainstBruteForce(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
-	tb := newTbl()
+	tb := newTree()
 	set := map[string]bool{}
 	for i := 0; i < 600; i++ {
 		k := k2(rng.Intn(40), rng.Intn(40))
-		tb.tree(0).Put(k, k, true)
+		tb.Put(k, k, true)
 		set[string(k)] = true
 	}
 	keys := sortedKeys(set)
-	c := &cursor{tbl: tb, idx: 0}
+	c := &rawCursor{t: tb}
 	for trial := 0; trial < 3000; trial++ {
 		var q []byte
 		if rng.Intn(2) == 0 {
@@ -91,9 +91,9 @@ func TestSeekModesAgainstBruteForce(t *testing.T) {
 					}
 				}
 			}
-			rc := c.seek(q, mode)
-			if (want == nil) != (rc != rcOK) || (want != nil && !bytes.Equal(c.key, want)) {
-				t.Fatalf("mode %d q=%x: got rc=%d key=%x want %x", mode, q, rc, c.key, want)
+			ok := c.seek(q, mode)
+			if (want == nil) != !ok || (want != nil && !bytes.Equal(c.key, want)) {
+				t.Fatalf("mode %d q=%x: got ok=%v key=%x want %x", mode, q, ok, c.key, want)
 			}
 		}
 	}
@@ -101,14 +101,14 @@ func TestSeekModesAgainstBruteForce(t *testing.T) {
 
 // 全量正向/反向扫描：树未变时走快路径，必须与排序结果一致。
 func TestFullScanFastPath(t *testing.T) {
-	tb := newTbl()
+	tb := newTree()
 	n := 5000
 	for i := 0; i < n; i++ {
-		tb.tree(0).Put(k(i), k(i), false)
+		tb.Put(k(i), k(i), false)
 	}
-	c := &cursor{tbl: tb, idx: 0}
+	c := &rawCursor{t: tb}
 	i := 0
-	for rc := c.seek(nil, seekFirst); rc == rcOK; rc = c.step(1) {
+	for ok := c.seek(nil, seekFirst); ok; ok = c.step(1) {
 		if !bytes.Equal(c.key, k(i)) {
 			t.Fatalf("forward %d: got %x", i, c.key)
 		}
@@ -117,7 +117,7 @@ func TestFullScanFastPath(t *testing.T) {
 	if i != n {
 		t.Fatalf("forward count %d", i)
 	}
-	for rc := c.seek(nil, seekLast); rc == rcOK; rc = c.step(-1) {
+	for ok := c.seek(nil, seekLast); ok; ok = c.step(-1) {
 		i--
 		if !bytes.Equal(c.key, k(i)) {
 			t.Fatalf("backward %d: got %x", i, c.key)
@@ -131,10 +131,10 @@ func TestFullScanFastPath(t *testing.T) {
 // 扫描过程中随机插入/删除（含删除游标当前所在的键），游标必须始终返回"当前键之后最近的存活键"。
 func TestScanWithConcurrentModification(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
-	tb := newTbl()
+	tb := newTree()
 	live := map[int]bool{}
 	for i := 0; i < 3000; i++ {
-		tb.tree(0).Put(k(i*2), nil, false)
+		tb.Put(k(i*2), nil, false)
 		live[i*2] = true
 	}
 	next := func(after int) (int, bool) { // 暴力：> after 的最小存活键
@@ -146,7 +146,7 @@ func TestScanWithConcurrentModification(t *testing.T) {
 		}
 		return best, ok
 	}
-	c := &cursor{tbl: tb, idx: 0}
+	c := &rawCursor{t: tb}
 	c.seek(nil, seekFirst)
 	cur := 0
 	for steps := 0; steps < 1500; steps++ {
@@ -156,25 +156,25 @@ func TestScanWithConcurrentModification(t *testing.T) {
 			switch rng.Intn(3) {
 			case 0:
 				if !live[v] {
-					tb.tree(0).Put(k(v), nil, false)
+					tb.Put(k(v), nil, false)
 					live[v] = true
 				}
 			case 1:
 				if live[v] {
-					tb.tree(0).Delete(k(v))
+					tb.Delete(k(v))
 					delete(live, v)
 				}
 			case 2: // 删除游标当前所在的键
 				if live[cur] {
-					tb.tree(0).Delete(k(cur))
+					tb.Delete(k(cur))
 					delete(live, cur)
 				}
 			}
 		}
 		want, ok := next(cur)
-		rc := c.step(1)
-		if ok != (rc == rcOK) {
-			t.Fatalf("step %d: ok=%v rc=%d", steps, ok, rc)
+		got1 := c.step(1)
+		if ok != got1 {
+			t.Fatalf("step %d: want ok=%v got %v", steps, ok, got1)
 		}
 		if !ok {
 			return
@@ -193,16 +193,4 @@ func k2int(b []byte) uint64 {
 		v = v<<8 | uint64(x)
 	}
 	return v
-}
-
-// 树里原本没有索引时，读路径不能创建/修改 map（读锁下并发安全的前提）。
-func TestReadPathDoesNotMutate(t *testing.T) {
-	tb := newTbl()
-	c := &cursor{tbl: tb, idx: 3}
-	if c.seek(nil, seekFirst) == rcOK || len(tb.trees) != 0 {
-		t.Fatal("read path mutated table or found data in empty index")
-	}
-	if emptyTree.Len() != 0 {
-		t.Fatal("shared emptyTree was modified")
-	}
 }

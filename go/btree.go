@@ -17,8 +17,8 @@ const (
 type node struct {
 	leaf     bool
 	keys     [][]byte
-	vals     [][]byte // 仅叶子
-	children []*node  // 仅内部节点，len = len(keys)+1
+	vals     []any   // 仅叶子
+	children []*node // 仅内部节点，len = len(keys)+1
 	next     *node
 	prev     *node
 }
@@ -77,7 +77,7 @@ func sepHex(keys [][]byte, i int) string {
 	return fmt.Sprintf("%x", keys[i])
 }
 
-func (t *BTree) Get(key []byte) ([]byte, bool) {
+func (t *BTree) Get(key []byte) (any, bool) {
 	l := t.findLeaf(key)
 	i := l.leafIndex(key)
 	if i < len(l.keys) && bytes.Equal(l.keys[i], key) {
@@ -87,9 +87,8 @@ func (t *BTree) Get(key []byte) ([]byte, bool) {
 }
 
 // Put 插入；overwrite=false 且 key 已存在时返回 false。
-func (t *BTree) Put(key, val []byte, overwrite bool) bool {
+func (t *BTree) Put(key []byte, val any, overwrite bool) bool {
 	key = append([]byte(nil), key...)
-	val = append([]byte(nil), val...)
 	exists, sk, sn := t.insert(t.root, key, val, overwrite)
 	if exists && !overwrite {
 		return false
@@ -105,7 +104,7 @@ func (t *BTree) Put(key, val []byte, overwrite bool) bool {
 }
 
 // insert 返回 (key 是否已存在, 分裂产生的分隔 key, 新右节点)。
-func (t *BTree) insert(n *node, key, val []byte, overwrite bool) (bool, []byte, *node) {
+func (t *BTree) insert(n *node, key []byte, val any, overwrite bool) (bool, []byte, *node) {
 	if n.leaf {
 		i := n.leafIndex(key)
 		if i < len(n.keys) && bytes.Equal(n.keys[i], key) {
@@ -115,14 +114,14 @@ func (t *BTree) insert(n *node, key, val []byte, overwrite bool) (bool, []byte, 
 			return true, nil, nil
 		}
 		n.keys = insertAt(n.keys, i, key)
-		n.vals = insertAt(n.vals, i, val)
+		n.vals = insertAnyAt(n.vals, i, val)
 		if len(n.keys) <= maxKeys {
 			return false, nil, nil
 		}
 		mid := len(n.keys) / 2
 		r := &node{leaf: true,
 			keys: append([][]byte(nil), n.keys[mid:]...),
-			vals: append([][]byte(nil), n.vals[mid:]...),
+			vals: append([]any(nil), n.vals[mid:]...),
 			next: n.next, prev: n}
 		if n.next != nil {
 			n.next.prev = r
@@ -201,7 +200,7 @@ func (n *node) rebalance(i int) {
 		last := len(left.keys) - 1
 		if c.leaf {
 			c.keys = insertAt(c.keys, 0, left.keys[last])
-			c.vals = insertAt(c.vals, 0, left.vals[last])
+			c.vals = insertAnyAt(c.vals, 0, left.vals[last])
 			left.keys, left.vals = left.keys[:last], left.vals[:last]
 			n.keys[i-1] = c.keys[0]
 		} else {
@@ -258,7 +257,7 @@ type pos struct {
 
 func (p pos) valid() bool { return p.n != nil && p.i >= 0 && p.i < len(p.n.keys) }
 func (p pos) key() []byte { return p.n.keys[p.i] }
-func (p pos) val() []byte { return p.n.vals[p.i] }
+func (p pos) val() any    { return p.n.vals[p.i] }
 
 // normalize: 越过叶子末尾时进入下一个叶子。
 func (p pos) normalize() pos {
@@ -320,6 +319,13 @@ func (p pos) Next() pos { return pos{p.n, p.i + 1}.normalize() }
 func (p pos) Prev() pos { return pos{p.n, p.i - 1}.back() }
 
 func insertAt(s [][]byte, i int, v []byte) [][]byte {
+	s = append(s, nil)
+	copy(s[i+1:], s[i:])
+	s[i] = v
+	return s
+}
+
+func insertAnyAt(s []any, i int, v any) []any {
 	s = append(s, nil)
 	copy(s[i+1:], s[i:])
 	s[i] = v
