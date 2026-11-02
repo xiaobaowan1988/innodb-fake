@@ -90,7 +90,7 @@ def one_run(seed, steps, nsess, isos):
         cur.execute(f"CREATE DATABASE IF NOT EXISTS {db}"); cur.execute(f"USE {db}"); cur.execute("DROP TABLE IF EXISTS t")
         cur.execute(f"CREATE TABLE t (id INT PRIMARY KEY, k INT, u INT, v INT, KEY ik(k), UNIQUE KEY uu(u)) ENGINE={eng}")
         cur.execute("INSERT INTO t VALUES (2,1,5,10),(4,2,7,20),(6,1,NULL,30),(8,3,9,40),(10,0,11,50)")
-        cur.execute("SET GLOBAL innodb_lock_wait_timeout=3")
+        cur.execute("SET GLOBAL innodb_lock_wait_timeout=20")
         r = random.Random(seed); sess = [Session(db, f"S{n+1}") for n in range(nsess)]
         for s, iso in zip(sess, isos):
             run_sql(s.c, f"SET SESSION TRANSACTION ISOLATION LEVEL {iso}")
