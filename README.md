@@ -11,7 +11,7 @@
 4. `mysqld --console --user=mysql`，另开终端执行 `scripts/verify.sql`
 
 ## 状态
-Go 库已编译并通过 C 程序调用验证；C++ 插件尚未在真实 MySQL 源码树中编译（环境中无 MySQL 源码）。
+Go 库、C++ 插件（针对 MySQL 8.0.40 源码）、mysqld 均已编译；`INSTALL PLUGIN`、建表、写入、全表扫描、索引查询已上机验证，结果见下。
 
 ## 验证结果（MySQL 8.0.40）
 - `CREATE TABLE ... ENGINE=MyEngine` -> `create`、`open`、`[go] Open`
