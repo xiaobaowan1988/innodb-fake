@@ -1,16 +1,24 @@
 package main
 
-// 事务、多版本、行锁。纯 Go，不依赖 cgo，可直接 `go test -race`。设计见 docs/plan-mvcc.md。
+// 事务、多版本、行锁、间隙锁。纯 Go，不依赖 cgo，可直接 `go test -race`。
+// 设计见 docs/plan-mvcc.md 与 docs/plan-gap-latch.md。
 //
-// 锁顺序（必须遵守，否则会死锁）：
+// 没有全局数据锁：并发控制分三层——
+//   - 逻辑层：行锁（lm，分片）+ 间隙锁（gap.go）+ MVCC 版本链；
+//   - 物理层：每棵 B+ 树自己的两级锁（btree.go：smo 锁 + 叶子锁）；
+//   - 版本链受它所在的"主索引叶子锁"保护：读者在 GetFn/Locate 回调里遍历链，写者在 Upsert/Modify 回调里修改链。
 //
-//	行锁(lm) —— 先取行锁，且取行锁时不得持有 e.mu
-//	e.mu     —— 保护所有 B+ 树的结构和版本链
-//	e.tmu    —— 保护 clock / active / 各事务的视图快照；永远在 e.mu 之内取，不反过来
-//	lm.mu    —— 只保护锁表，内部不再取其它锁
+// 加锁顺序（必须遵守，否则会死锁；任何等待都发生在释放下面第 2~4 项之后）：
+//
+//  1. 行锁（lm 分片）——只在不持有任何别的锁时才可能阻塞
+//  2. 唯一键条纹锁（按下标升序）
+//  3. 各索引 gapMu：发布者持读锁（按索引号升序），登记间隙的游标持写锁
+//  4. 树锁：smo → 叶子锁。同一个 goroutine 不嵌套任何一种读写锁的读锁，也最多同时持有一个叶子锁
+//  5. e.tmu、lm.dmu、e.pmu、e.mu 都是叶子锁，持有它们时不再取别的锁
 import (
 	"bytes"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,7 +59,7 @@ type secKey struct {
 	unique bool // 调用方已排除含 NULL 的键
 }
 
-// rowVer 是行的一个版本。字段创建后不再修改（prev 在 purge 时除外，且只在写锁下）。
+// rowVer 是行的一个版本。字段创建后不再修改（prev 在 purge 时除外，且只在叶子写锁内）。
 type rowVer struct {
 	trx     *Txn
 	deleted bool // 墓碑
@@ -60,10 +68,14 @@ type rowVer struct {
 	prev    *rowVer
 }
 
-// rowHead 是主索引的值：版本链头（最新版本）。
+// rowHead 是主索引的值：版本链头（最新版本）。head 为 nil 表示链是空的（回滚弹出最后一个版本到删除键之间的短暂窗口），
+// 所有读者都要把它当作"不存在"。head 的内容受它所在叶子的锁保护。
 type rowHead struct{ head *rowVer }
 
+var tableSeq atomic.Uint32
+
 type table struct {
+	id   uint32
 	name string
 	pri  *BTree      // 主键编码 -> *rowHead
 	sec  []*BTree    // 下标 = 索引号，[0] 不用；条目键 = 二级索引键 + 主键，值为 nil
@@ -75,7 +87,7 @@ type table struct {
 }
 
 func newTable(name string, nidx int) *table {
-	t := &table{name: name, pri: NewBTree()}
+	t := &table{id: tableSeq.Add(1), name: name, pri: NewBTree()}
 	t.sec = make([]*BTree, nidx)
 	t.ix = make([]*idxState, nidx)
 	for i := 0; i < nidx; i++ {
@@ -87,14 +99,6 @@ func newTable(name string, nidx int) *table {
 	return t
 }
 
-func (tb *table) head(pk []byte) *rowHead {
-	v, ok := tb.pri.Get(pk)
-	if !ok {
-		return nil
-	}
-	return v.(*rowHead)
-}
-
 func (tb *table) tree(idx int) *BTree {
 	if idx == 0 {
 		return tb.pri
@@ -102,6 +106,21 @@ func (tb *table) tree(idx int) *BTree {
 	return tb.sec[idx]
 }
 
+// withHead 在主索引叶子读锁内对 pk 的版本链头调用 fn；键不存在或链为空时 h 为 nil。
+// fn 必须很短，且不得再取别的锁。
+func (tb *table) withHead(pk []byte, fn func(h *rowHead)) {
+	if !tb.pri.GetFn(pk, func(v any) {
+		if h := v.(*rowHead); h.head != nil {
+			fn(h)
+		} else {
+			fn(nil)
+		}
+	}) {
+		fn(nil)
+	}
+}
+
+// undoRec 记录一次版本压入，供回滚、语句回滚、保存点使用。
 type undoRec struct {
 	tbl  *table
 	pk   []byte
@@ -127,10 +146,9 @@ type Txn struct {
 	done     bool
 	doneCh   chan struct{}            // 事务结束时关闭（供"等待事务结束"的等待者）
 	gaps     map[*idxState][]*gapLock // 本事务登记的间隙锁（仅所有者访问）
+	held     map[lockKey]struct{}     // 持有的行锁（仅所有者访问）
 
-	// 以下两个字段由 lm.mu 保护
-	held      map[lockKey]struct{}
-	blockedOn []*Txn
+	blockedOn []*Txn // 正在等待的事务集合，由 lm.dmu 保护
 }
 
 type purgeItem struct {
@@ -139,8 +157,10 @@ type purgeItem struct {
 	ts  uint64
 }
 
+const nStripes = 256
+
 type Engine struct {
-	mu     sync.RWMutex
+	mu     sync.RWMutex // 只保护 tables 映射（打开/删除/重命名表），不在数据路径上
 	tables map[string]*table
 
 	tmu    sync.Mutex
@@ -149,6 +169,8 @@ type Engine struct {
 	active map[*Txn]struct{}
 
 	lm lockMgr
+
+	ustripes [nStripes]sync.Mutex // 唯一二级索引键的"检查+发布"条纹锁
 
 	pmu sync.Mutex
 	pq  []purgeItem
@@ -162,7 +184,9 @@ func NewEngine() *Engine {
 		active:      map[*Txn]struct{}{},
 		LockTimeout: 50 * time.Second,
 	}
-	e.lm.locks = map[lockKey]*rowLock{}
+	for i := range e.lm.shards {
+		e.lm.shards[i].locks = map[lockKey]*rowLock{}
+	}
 	return e
 }
 
@@ -204,11 +228,7 @@ func (e *Engine) RenameTable(from, to string) {
 	e.mu.Unlock()
 }
 
-func (e *Engine) Count(tb *table) int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return tb.pri.Len()
-}
+func (e *Engine) Count(tb *table) int { return tb.pri.Len() }
 
 // ---------------------------------------------------------------- 事务
 
@@ -234,7 +254,7 @@ func (t *Txn) StmtBegin(iso int) {
 }
 
 // readView 惰性创建视图：RR 在事务内第一次一致性读时创建并保持到事务结束。
-// 调用者须持有 e.mu（读锁或写锁）。
+// 只取 tmu（叶子锁），可以在任何地方调用。
 func (t *Txn) readView() *ReadView {
 	if t.view != nil {
 		return t.view
@@ -255,7 +275,7 @@ func (v *rowVer) visibleTo(rv *ReadView) bool {
 	return ts != 0 && ts <= rv.snap
 }
 
-// visible 返回链上第一个对视图可见的版本。
+// visible 返回链上第一个对视图可见的版本。调用者须持有该链所在叶子的锁。
 func (h *rowHead) visible(rv *ReadView) *rowVer {
 	for v := h.head; v != nil; v = v.prev {
 		if v.visibleTo(rv) {
@@ -295,9 +315,7 @@ func (e *Engine) Rollback(t *Txn) {
 		return
 	}
 	t.done = true
-	e.mu.Lock()
-	e.undoTo(t, 0)
-	e.mu.Unlock()
+	e.undoTo(t, 0) // 放锁之前撤销：此时仍持有这些行的 X 锁，没有别的写者
 	e.tmu.Lock()
 	delete(e.active, t)
 	e.tmu.Unlock()
@@ -307,37 +325,42 @@ func (e *Engine) Rollback(t *Txn) {
 }
 
 // RollbackStmt 只撤销当前语句的修改，行锁保留（与 InnoDB 一致）。
-func (e *Engine) RollbackStmt(t *Txn) {
-	e.mu.Lock()
-	e.undoTo(t, t.stmtBeg)
-	e.mu.Unlock()
-}
+func (e *Engine) RollbackStmt(t *Txn) { e.undoTo(t, t.stmtBeg) }
 
 func (t *Txn) Savepoint() int { return len(t.undo) }
 
 func (e *Engine) RollbackToSavepoint(t *Txn, sp int) {
-	e.mu.Lock()
 	e.undoTo(t, sp)
-	e.mu.Unlock()
 	if t.stmtBeg > len(t.undo) {
 		t.stmtBeg = len(t.undo)
 	}
 }
 
-// undoTo 把撤销日志回退到长度 n。调用者须持有 e.mu 写锁。
+// undoTo 把撤销日志回退到长度 n。调用者持有这些行的 X 锁，所以没有并发写者（purge 也会因为拿不到 X 锁而跳过）。
 func (e *Engine) undoTo(t *Txn, n int) {
 	for len(t.undo) > n {
 		u := t.undo[len(t.undo)-1]
 		t.undo = t.undo[:len(t.undo)-1]
-		// 持有行 X 锁期间链头一定是自己最新压入的版本
-		u.head.head = u.ver.prev
-		for _, sk := range u.ver.sec {
-			if !chainReferences(u.head, sk) {
-				u.tbl.sec[sk.idx].Delete(concat(sk.key, u.pk))
+		var drop []secKey
+		empty := false
+		// 1. 在主索引叶子写锁内弹出版本，并算出哪些二级索引条目不再被链上任何版本引用
+		u.tbl.pri.Modify(u.pk, func(v any) {
+			h := v.(*rowHead)
+			h.head = u.ver.prev
+			for _, sk := range u.ver.sec {
+				if !chainReferences(h, sk) {
+					drop = append(drop, sk)
+				}
 			}
+			empty = h.head == nil
+		})
+		// 2. 删除这些二级索引条目（读者此时即使还看到它们，也会因为"条目与可见版本不匹配"而跳过）
+		for _, sk := range drop {
+			u.tbl.sec[sk.idx].Delete(concat(sk.key, u.pk))
 		}
-		if u.head.head == nil {
-			u.tbl.pri.Delete(u.pk)
+		// 3. 链空了就删掉主索引里的键
+		if empty {
+			u.tbl.pri.DeleteIf(u.pk, func(v any) bool { return v.(*rowHead).head == nil })
 		}
 	}
 }
@@ -366,7 +389,14 @@ func copySec(sec []secKey) []secKey {
 	return r
 }
 
-// ---------------------------------------------------------------- 行锁管理器
+// pushOn 把新版本压到链头并记 undo。调用者须在该链所在叶子的写锁内（Upsert/Modify 的回调里）。
+func (t *Txn) pushOn(tb *table, pk []byte, h *rowHead, v *rowVer) {
+	v.prev = h.head
+	h.head = v
+	t.undo = append(t.undo, undoRec{tb, append([]byte(nil), pk...), h, v})
+}
+
+// ---------------------------------------------------------------- 行锁管理器（分片）
 
 type lockKey struct {
 	tbl *table
@@ -384,33 +414,63 @@ type rowLock struct {
 	waiters []*waiter
 }
 
-type lockMgr struct {
+const lmShards = 64
+
+type lockShard struct {
 	mu    sync.Mutex
 	locks map[lockKey]*rowLock
 }
 
-// lock 取行锁，必要时阻塞。调用者不得持有 e.mu。
+// lockMgr 的锁表分成 64 个分片；等待图（Txn.blockedOn）由独立的小锁 dmu 保护，只在要阻塞或唤醒等待者时才取。
+// 顺序：分片锁 -> dmu。
+type lockMgr struct {
+	shards [lmShards]lockShard
+	dmu    sync.Mutex
+}
+
+func (lm *lockMgr) shard(key lockKey) *lockShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(key.pk); i++ {
+		h ^= uint32(key.pk[i])
+		h *= 16777619
+	}
+	h ^= key.tbl.id * 2654435761
+	h *= 16777619
+	return &lm.shards[h%lmShards]
+}
+
+func (sh *lockShard) cleanup(key lockKey, rl *rowLock) {
+	if rl.x == nil && len(rl.s) == 0 && len(rl.waiters) == 0 {
+		delete(sh.locks, key)
+	}
+}
+
+// lock 取行锁，必要时阻塞。调用者不得持有任何树锁、gapMu、条纹锁。
 func (e *Engine) lock(t *Txn, tb *table, pk []byte, mode int) error {
 	return e.lm.lock(t, tb, pk, mode)
 }
 
 func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 	key := lockKey{tb, string(pk)}
-	deadline := time.Now().Add(t.timeout)
+	sh := lm.shard(key)
+	var deadline time.Time
+	waited := false
 	for {
-		lm.mu.Lock()
-		rl := lm.locks[key]
+		sh.mu.Lock()
+		rl := sh.locks[key]
 		if rl == nil {
 			rl = &rowLock{s: map[*Txn]struct{}{}}
-			lm.locks[key] = rl
+			sh.locks[key] = rl
 		}
 		if rl.x == t {
-			lm.mu.Unlock()
+			sh.mu.Unlock()
+			lm.clearWait(t, waited)
 			return nil
 		}
 		if mode == lockS {
 			if _, ok := rl.s[t]; ok {
-				lm.mu.Unlock()
+				sh.mu.Unlock()
+				lm.clearWait(t, waited)
 				return nil
 			}
 		}
@@ -433,21 +493,30 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 				rl.s[t] = struct{}{}
 			}
 			t.held[key] = struct{}{}
-			t.blockedOn = nil
-			lm.mu.Unlock()
+			sh.mu.Unlock()
+			lm.clearWait(t, waited)
 			return nil
 		}
+		lm.dmu.Lock()
 		t.blockedOn = blockers
-		if lm.deadlock(t) {
+		cyc := lm.deadlock(t)
+		if cyc {
 			t.blockedOn = nil
-			lm.cleanup(key, rl)
-			lm.mu.Unlock()
+		}
+		lm.dmu.Unlock()
+		if cyc {
+			sh.cleanup(key, rl)
+			sh.mu.Unlock()
 			return ErrDeadlock
 		}
 		w := &waiter{ch: make(chan struct{}), txn: t}
 		rl.waiters = append(rl.waiters, w)
-		lm.mu.Unlock()
+		sh.mu.Unlock()
+		waited = true
 
+		if deadline.IsZero() {
+			deadline = time.Now().Add(t.timeout)
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			lm.abandon(t, key, w)
@@ -464,29 +533,58 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 	}
 }
 
+func (lm *lockMgr) clearWait(t *Txn, waited bool) {
+	if waited {
+		lm.dmu.Lock()
+		t.blockedOn = nil
+		lm.dmu.Unlock()
+	}
+}
+
+// tryLock 不阻塞地尝试取行锁，取不到返回 false（purge 用）。
+func (lm *lockMgr) tryLock(t *Txn, tb *table, pk []byte, mode int) bool {
+	key := lockKey{tb, string(pk)}
+	sh := lm.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	rl := sh.locks[key]
+	if rl == nil {
+		rl = &rowLock{s: map[*Txn]struct{}{}}
+		sh.locks[key] = rl
+	}
+	if rl.x != nil && rl.x != t || mode == lockX && len(rl.s) > 0 {
+		sh.cleanup(key, rl)
+		return false
+	}
+	if mode == lockX {
+		rl.x = t
+	} else {
+		rl.s[t] = struct{}{}
+	}
+	t.held[key] = struct{}{}
+	return true
+}
+
 // abandon：等待超时，退出等待队列。
 func (lm *lockMgr) abandon(t *Txn, key lockKey, w *waiter) {
-	lm.mu.Lock()
-	t.blockedOn = nil
-	if rl := lm.locks[key]; rl != nil {
+	sh := lm.shard(key)
+	sh.mu.Lock()
+	if rl := sh.locks[key]; rl != nil {
 		for i, x := range rl.waiters {
 			if x == w {
 				rl.waiters = append(rl.waiters[:i], rl.waiters[i+1:]...)
 				break
 			}
 		}
-		lm.cleanup(key, rl)
+		sh.cleanup(key, rl)
 	}
-	lm.mu.Unlock()
+	sh.mu.Unlock()
+	lm.dmu.Lock()
+	t.blockedOn = nil
+	lm.dmu.Unlock()
 }
 
-func (lm *lockMgr) cleanup(key lockKey, rl *rowLock) {
-	if rl.x == nil && len(rl.s) == 0 && len(rl.waiters) == 0 {
-		delete(lm.locks, key)
-	}
-}
-
-// deadlock 沿"等待 -> 持有者"的边做 DFS，若能回到 t 就是死锁。调用者持有 lm.mu。
+// deadlock 沿"等待 -> 持有者"的边做 DFS，若能回到 t 就是死锁。调用者持有 lm.dmu。
 func (lm *lockMgr) deadlock(t *Txn) bool {
 	seen := map[*Txn]bool{}
 	var dfs func(x *Txn) bool
@@ -508,32 +606,76 @@ func (lm *lockMgr) deadlock(t *Txn) bool {
 }
 
 func (lm *lockMgr) releaseAll(t *Txn) {
-	lm.mu.Lock()
 	for key := range t.held {
-		rl := lm.locks[key]
-		if rl == nil {
+		sh := lm.shard(key)
+		sh.mu.Lock()
+		if rl := sh.locks[key]; rl != nil {
+			if rl.x == t {
+				rl.x = nil
+			}
+			delete(rl.s, t)
+			if len(rl.waiters) > 0 {
+				lm.dmu.Lock()
+				for _, w := range rl.waiters {
+					w.txn.blockedOn = nil // 被唤醒者的等待边已过期，清掉，避免后续死锁检测误判
+					close(w.ch)
+				}
+				lm.dmu.Unlock()
+				rl.waiters = nil
+			}
+			sh.cleanup(key, rl)
+		}
+		sh.mu.Unlock()
+	}
+	clear(t.held)
+}
+
+// ---------------------------------------------------------------- 唯一键条纹锁
+
+// lockUniqueStripes 对本次写入涉及的每个唯一二级索引键取条纹锁（按下标升序），返回释放函数。
+// 同一唯一键的并发"检查+发布"因此被串行化，不同键互不影响。
+func (e *Engine) lockUniqueStripes(tb *table, sec []secKey) func() {
+	var idx []int
+	for _, sk := range sec {
+		if !sk.unique {
 			continue
 		}
-		if rl.x == t {
-			rl.x = nil
+		h := uint32(2166136261)
+		for _, b := range sk.key {
+			h ^= uint32(b)
+			h *= 16777619
 		}
-		delete(rl.s, t)
-		for _, w := range rl.waiters {
-			w.txn.blockedOn = nil // 被唤醒者的等待边已过期，清掉，避免后续死锁检测误判
-			close(w.ch)
+		h ^= tb.id*2654435761 + uint32(sk.idx)*40503
+		s := int(h % nStripes)
+		dup := false
+		for _, x := range idx {
+			if x == s {
+				dup = true
+				break
+			}
 		}
-		rl.waiters = nil
-		lm.cleanup(key, rl)
+		if !dup {
+			idx = append(idx, s)
+		}
 	}
-	t.held = map[lockKey]struct{}{}
-	t.blockedOn = nil
-	lm.mu.Unlock()
+	if len(idx) == 0 {
+		return func() {}
+	}
+	sort.Ints(idx)
+	for _, s := range idx {
+		e.ustripes[s].Lock()
+	}
+	return func() {
+		for i := len(idx) - 1; i >= 0; i-- {
+			e.ustripes[idx[i]].Unlock()
+		}
+	}
 }
 
 // ---------------------------------------------------------------- 写操作
 
 // checkUnique 检查唯一二级索引。skip 是应忽略的主键（自己和被更新的旧行）。
-// 返回 wait != nil 表示必须先等待该行上的另一个活跃事务结束，再重新检查。调用者持有 e.mu 写锁。
+// 返回 wait != nil 表示必须先等待该行上的另一个活跃事务结束，再重新检查。调用者已持有相关的条纹锁。
 func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wait []byte, err error) {
 	for _, sk := range sec {
 		if !sk.unique {
@@ -546,25 +688,26 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 					return true
 				}
 			}
-			h := tb.head(cpk)
-			if h == nil {
-				return true
-			}
-			v := h.head
-			if v.trx != t && v.trx.commitTS.Load() == 0 {
-				wait = cpk // 另一个活跃事务改过这一行：等它结束
-				return false
-			}
-			if v.deleted {
-				return true
-			}
-			for _, s := range v.sec {
-				if s.idx == sk.idx && bytes.Equal(s.key, sk.key) {
-					err = DupError{sk.idx}
-					return false
+			tb.withHead(cpk, func(h *rowHead) {
+				if h == nil {
+					return
 				}
-			}
-			return true
+				v := h.head
+				if v.trx != t && v.trx.commitTS.Load() == 0 {
+					wait = cpk // 另一个活跃事务改过这一行：等它结束
+					return
+				}
+				if v.deleted {
+					return
+				}
+				for _, s := range v.sec {
+					if s.idx == sk.idx && bytes.Equal(s.key, sk.key) {
+						err = DupError{sk.idx}
+						return
+					}
+				}
+			})
+			return wait == nil && err == nil
 		})
 		if wait != nil || err != nil {
 			return wait, err
@@ -573,16 +716,8 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 	return nil, nil
 }
 
-// pushVersion 把新版本压到链头（h 为 nil 则新建链）。调用者持有 e.mu 写锁。
-func (e *Engine) pushVersion(t *Txn, tb *table, pk []byte, h *rowHead, v *rowVer) {
-	if h == nil {
-		h = &rowHead{head: v}
-		tb.pri.Put(pk, h, false)
-	} else {
-		v.prev = h.head
-		h.head = v
-	}
-	t.undo = append(t.undo, undoRec{tb, append([]byte(nil), pk...), h, v})
+// putSecEntries 为新版本发布它的二级索引条目。
+func putSecEntries(tb *table, pk []byte, v *rowVer) {
 	for _, s := range v.sec {
 		tb.sec[s.idx].Put(concat(s.key, pk), nil, true)
 	}
@@ -593,38 +728,64 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 		return err
 	}
 	for {
-		e.mu.Lock()
-		h := tb.head(pk)
-		if h != nil && !h.head.deleted {
-			e.mu.Unlock()
+		unlockU := e.lockUniqueStripes(tb, sec)
+		live := false
+		exists := tb.pri.GetFn(pk, func(v any) {
+			if h := v.(*rowHead); h.head != nil && !h.head.deleted {
+				live = true
+			}
+		})
+		if live {
+			unlockU()
 			return DupError{0}
 		}
 		wait, err := e.checkUnique(t, tb, [][]byte{pk}, sec)
 		if err != nil {
-			e.mu.Unlock()
+			unlockU()
 			return err
 		}
 		if wait != nil {
-			e.mu.Unlock()
+			unlockU()
 			if err := e.lm.lock(t, tb, wait, lockS); err != nil {
 				return err
 			}
 			continue
 		}
 		// 插入意向：新条目落在别的事务的间隙锁里就必须等它结束；检查和发布在同一把 gapMu 读锁内完成
-		entries := newEntries(tb, pk, h != nil, sec)
+		entries := newEntries(tb, pk, exists, sec)
 		unlockIdx := tb.lockIdxForPublish(entries)
 		if holder := tb.gapHolder(t, entries); holder != nil {
 			unlockIdx()
-			e.mu.Unlock()
+			unlockU()
 			if err := e.lm.waitTxn(t, holder); err != nil {
 				return err
 			}
 			continue
 		}
-		e.pushVersion(t, tb, pk, h, &rowVer{trx: t, data: append([]byte(nil), row...), sec: copySec(sec)})
+		v := &rowVer{trx: t, data: append([]byte(nil), row...), sec: copySec(sec)}
+		dup := false
+		tb.pri.Upsert(pk, func(old any, ex bool) (any, bool) {
+			if ex {
+				h := old.(*rowHead)
+				if h.head != nil && !h.head.deleted {
+					dup = true
+					return nil, false
+				}
+				t.pushOn(tb, pk, h, v)
+				return nil, false
+			}
+			h := &rowHead{}
+			t.pushOn(tb, pk, h, v)
+			return h, true
+		})
+		if dup {
+			unlockIdx()
+			unlockU()
+			return DupError{0}
+		}
+		putSecEntries(tb, pk, v)
 		unlockIdx()
-		e.mu.Unlock()
+		unlockU()
 		return nil
 	}
 }
@@ -641,27 +802,33 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 		}
 	}
 	for {
-		e.mu.Lock()
-		oh := tb.head(oldpk)
-		if oh == nil || oh.head.deleted {
-			e.mu.Unlock()
+		unlockU := e.lockUniqueStripes(tb, sec)
+		oldLive := false
+		tb.withHead(oldpk, func(h *rowHead) { oldLive = h != nil && !h.head.deleted })
+		if !oldLive {
+			unlockU()
 			return ErrNotFound
 		}
-		var nh *rowHead
+		newExists := false
 		if !same {
-			nh = tb.head(newpk)
-			if nh != nil && !nh.head.deleted {
-				e.mu.Unlock()
+			newLive := false
+			newExists = tb.pri.GetFn(newpk, func(v any) {
+				if h := v.(*rowHead); h.head != nil && !h.head.deleted {
+					newLive = true
+				}
+			})
+			if newLive {
+				unlockU()
 				return DupError{0}
 			}
 		}
 		wait, err := e.checkUnique(t, tb, [][]byte{oldpk, newpk}, sec)
 		if err != nil {
-			e.mu.Unlock()
+			unlockU()
 			return err
 		}
 		if wait != nil {
-			e.mu.Unlock()
+			unlockU()
 			if err := e.lm.lock(t, tb, wait, lockS); err != nil {
 				return err
 			}
@@ -669,15 +836,17 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 		}
 		// 插入意向：主键不变时只有"新出现的二级索引条目"算插入；主键变了则新主键和它的二级索引条目都算
 		var entries []gapEntry
+		target := oldpk
 		if same {
 			entries = newEntries(tb, oldpk, true, sec)
 		} else {
-			entries = newEntries(tb, newpk, nh != nil, sec)
+			target = newpk
+			entries = newEntries(tb, newpk, newExists, sec)
 		}
 		unlockIdx := tb.lockIdxForPublish(entries)
 		if holder := tb.gapHolder(t, entries); holder != nil {
 			unlockIdx()
-			e.mu.Unlock()
+			unlockU()
 			if err := e.lm.waitTxn(t, holder); err != nil {
 				return err
 			}
@@ -685,13 +854,22 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 		}
 		nv := &rowVer{trx: t, data: append([]byte(nil), row...), sec: copySec(sec)}
 		if same {
-			e.pushVersion(t, tb, oldpk, oh, nv)
+			tb.pri.Modify(oldpk, func(v any) { t.pushOn(tb, oldpk, v.(*rowHead), nv) })
 		} else {
-			e.pushVersion(t, tb, oldpk, oh, &rowVer{trx: t, deleted: true})
-			e.pushVersion(t, tb, newpk, nh, nv)
+			tb.pri.Modify(oldpk, func(v any) { t.pushOn(tb, oldpk, v.(*rowHead), &rowVer{trx: t, deleted: true}) })
+			tb.pri.Upsert(newpk, func(old any, ex bool) (any, bool) {
+				if ex {
+					t.pushOn(tb, newpk, old.(*rowHead), nv)
+					return nil, false
+				}
+				h := &rowHead{}
+				t.pushOn(tb, newpk, h, nv)
+				return h, true
+			})
 		}
+		putSecEntries(tb, target, nv)
 		unlockIdx()
-		e.mu.Unlock()
+		unlockU()
 		return nil
 	}
 }
@@ -700,13 +878,13 @@ func (e *Engine) Delete(t *Txn, tb *table, pk []byte) error {
 	if err := e.lm.lock(t, tb, pk, lockX); err != nil {
 		return err
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	h := tb.head(pk)
-	if h == nil || h.head.deleted {
-		return nil
-	}
-	e.pushVersion(t, tb, pk, h, &rowVer{trx: t, deleted: true})
+	tb.pri.Modify(pk, func(v any) {
+		h := v.(*rowHead)
+		if h.head == nil || h.head.deleted {
+			return
+		}
+		t.pushOn(tb, pk, h, &rowVer{trx: t, deleted: true})
+	})
 	return nil
 }
 
@@ -714,29 +892,32 @@ func (e *Engine) Delete(t *Txn, tb *table, pk []byte) error {
 
 // GetRow 按主键读一行。lock == lockNone 为一致性读（快照），否则先加锁再读最新版本（当前读）。
 func (e *Engine) GetRow(t *Txn, tb *table, pk []byte, lock int) ([]byte, error) {
+	var data []byte
+	ok := false
 	if lock == lockNone {
-		e.mu.RLock()
-		defer e.mu.RUnlock()
-		h := tb.head(pk)
-		if h == nil {
-			return nil, ErrNotFound
+		rv := t.readView()
+		tb.withHead(pk, func(h *rowHead) {
+			if h == nil {
+				return
+			}
+			if v := h.visible(rv); v != nil && !v.deleted {
+				data, ok = v.data, true
+			}
+		})
+	} else {
+		if err := e.lm.lock(t, tb, pk, lock); err != nil {
+			return nil, err
 		}
-		v := h.visible(t.readView())
-		if v == nil || v.deleted {
-			return nil, ErrNotFound
-		}
-		return v.data, nil
+		tb.withHead(pk, func(h *rowHead) {
+			if h != nil && !h.head.deleted {
+				data, ok = h.head.data, true
+			}
+		})
 	}
-	if err := e.lm.lock(t, tb, pk, lock); err != nil {
-		return nil, err
-	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	h := tb.head(pk)
-	if h == nil || h.head.deleted {
+	if !ok {
 		return nil, ErrNotFound
 	}
-	return h.head.data, nil
+	return data, nil
 }
 
 // Cursor 是带事务语义的游标：只返回对当前事务可见（或已加锁的最新）的行。
@@ -750,6 +931,11 @@ type Cursor struct {
 	raw     rawCursor
 	ix      *idxState
 
+	// 一致性读主索引时，在定位回调（叶子读锁内）里顺便解析可见版本，省掉第二次下探
+	snapRV *ReadView
+	resRow []byte
+	resOK  bool
+
 	// 扫描边界（见 gap.go）
 	bKind      int // 外部设置的边界（SetBound）
 	bKey       []byte
@@ -760,7 +946,20 @@ type Cursor struct {
 }
 
 func (e *Engine) OpenCursor(t *Txn, tb *table, idx, lock, pkWidth int) *Cursor {
-	return &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx]}
+	c := &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx]}
+	if idx == 0 && lock == lockNone {
+		c.raw.hook = c.snapshotHook
+	}
+	return c
+}
+
+// snapshotHook 在叶子读锁内被调用：对主索引候选解析对当前视图可见的版本。
+func (c *Cursor) snapshotHook(_ []byte, val any) {
+	if h := val.(*rowHead); h.head != nil {
+		if v := h.visible(c.snapRV); v != nil && !v.deleted {
+			c.resRow, c.resOK = v.data, true
+		}
+	}
 }
 
 func (c *Cursor) pk() []byte {
@@ -786,34 +985,30 @@ func (c *Cursor) entryMatches(v *rowVer) bool {
 	return false
 }
 
-// snapshotRow 一致性读当前候选；调用者持有 e.mu（读锁即可）。
-func (c *Cursor) snapshotRow() ([]byte, bool) {
-	var h *rowHead
-	if c.idx == 0 {
-		h = c.raw.val.(*rowHead)
-	} else {
-		h = c.tbl.head(c.pk())
-	}
-	if h == nil {
-		return nil, false
-	}
-	v := h.visible(c.t.readView())
-	if v == nil || v.deleted || !c.entryMatches(v) {
-		return nil, false
-	}
-	return v.data, true
+// snapshotSecondary 一致性读：二级索引候选回主索引取对当前视图可见的版本，并核对条目属于该版本。
+func (c *Cursor) snapshotSecondary(rv *ReadView) (data []byte, ok bool) {
+	c.tbl.withHead(c.pk(), func(h *rowHead) {
+		if h == nil {
+			return
+		}
+		if v := h.visible(rv); v != nil && !v.deleted && c.entryMatches(v) {
+			data, ok = v.data, true
+		}
+	})
+	return
 }
 
 // currentRow 当前读（已持有行锁）：读链头。
-func (c *Cursor) currentRow(pk []byte) ([]byte, bool) {
-	h := c.tbl.head(pk)
-	if h == nil || h.head.deleted || !c.entryMatches(h.head) {
-		return nil, false
-	}
-	return h.head.data, true
+func (c *Cursor) currentRow(pk []byte) (data []byte, ok bool) {
+	c.tbl.withHead(pk, func(h *rowHead) {
+		if h != nil && !h.head.deleted && c.entryMatches(h.head) {
+			data, ok = h.head.data, true
+		}
+	})
+	return
 }
 
-// 唯一索引全键等值（flags 位）：命中且行存在时只加记录锁，不登记间隙。
+// 唯一索引全键（flags 位）：精确查找，或范围以 >= K 开始；K 恰好存在时只加记录锁，不登记间隙。
 const seekUniqueFull = 1
 
 // Seek 定位并返回第一个符合条件的行；Step 沿 dir 方向取下一行。
@@ -843,9 +1038,14 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		return nil, ErrNotFound
 	}
 	for {
-		e.mu.RLock()
+		var rv *ReadView
+		if c.lock == lockNone {
+			rv = c.t.readView()
+			c.snapRV = rv
+			c.resRow, c.resOK = nil, false
+		}
 		if gap {
-			c.ix.gapMu.Lock()
+			c.ix.gapMu.Lock() // 登记者：与"检查间隙冲突 + 发布条目"的插入者互斥
 		}
 		var ok bool
 		isFirstPos := isSeek // 本次是不是扫描的起点（反向扫描的起点要多锁一段）
@@ -876,13 +1076,17 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		}
 		if !inRange {
 			c.raw.valid = false
-			e.mu.RUnlock()
 			return nil, ErrNotFound
 		}
 		if c.lock == lockNone {
-			row, ok := c.snapshotRow()
-			e.mu.RUnlock()
-			if ok {
+			var row []byte
+			good := false
+			if c.idx == 0 {
+				row, good = c.resRow, c.resOK
+			} else {
+				row, good = c.snapshotSecondary(rv)
+			}
+			if good {
 				c.noteReturned()
 				return row, nil
 			}
@@ -890,27 +1094,22 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		}
 		pk := c.pk()
 		deadKey := c.raw.key
-		e.mu.RUnlock()
-		// 加锁读：先放掉 e.mu 再等行锁；醒来后树可能变了，游标会按 key 重新定位
+		// 加锁读：此刻没有持有任何树锁/gapMu，可以安全地等行锁；醒来后树可能变了，游标会按 key 重新定位
 		if err := e.lm.lock(c.t, c.tbl, pk, c.lock); err != nil {
 			return nil, err
 		}
-		e.mu.RLock()
 		row, ok2 := c.currentRow(pk)
-		e.mu.RUnlock()
 		if ok2 {
 			c.noteReturned()
 			return row, nil
 		}
 		if hit && gap {
 			// 唯一键命中的那一行其实已被删除：按"未命中"处理，补登记它前面的间隙，之后按普通同键扫描继续
-			e.mu.RLock()
 			c.ix.gapMu.Lock()
 			if c.raw.seek(deadKey, seekGE) && bytes.Equal(c.raw.key, deadKey) {
 				c.registerGap(1, true, false)
 			}
 			c.ix.gapMu.Unlock()
-			e.mu.RUnlock()
 		}
 		firstUniq = false
 	}
@@ -977,6 +1176,8 @@ func (e *Engine) oldestSnap() uint64 {
 }
 
 // purgeSome 最多处理 budget 个待清理项，返回处理个数。
+// 每一项先**尝试**取该行的 X 锁（拿不到就留到下次）：这保证 purge 不会和并发写者、回滚、
+// 正在读它的加锁读者竞争，也就不再需要任何全局锁。
 func (e *Engine) purgeSome(budget int) int {
 	oldest := e.oldestSnap()
 	e.pmu.Lock()
@@ -990,12 +1191,22 @@ func (e *Engine) purgeSome(budget int) int {
 	if n == 0 {
 		return 0
 	}
-	e.mu.Lock()
+	pt := &Txn{e: e, held: map[lockKey]struct{}{}}
+	var retry []purgeItem
 	for _, it := range items {
+		if !e.lm.tryLock(pt, it.tbl, it.pk, lockX) {
+			retry = append(retry, it)
+			continue
+		}
 		e.pruneChain(it.tbl, it.pk, oldest)
+		e.lm.releaseAll(pt)
 	}
-	e.mu.Unlock()
-	return n
+	if len(retry) > 0 {
+		e.pmu.Lock()
+		e.pq = append(e.pq, retry...)
+		e.pmu.Unlock()
+	}
+	return n - len(retry)
 }
 
 // purgeAll 反复清理直到没有可清理的项（测试用）。
@@ -1004,34 +1215,41 @@ func (e *Engine) purgeAll() {
 	}
 }
 
-// pruneChain 丢弃对所有活跃视图都不再可见的旧版本。调用者持有 e.mu 写锁。
+// pruneChain 丢弃对所有活跃视图都不再可见的旧版本。调用者持有该行的 X 锁。
 func (e *Engine) pruneChain(tb *table, pk []byte, oldest uint64) {
-	h := tb.head(pk)
-	if h == nil {
-		return
-	}
-	var keep *rowVer
-	for v := h.head; v != nil; v = v.prev {
-		if ts := v.trx.commitTS.Load(); ts != 0 && ts <= oldest {
-			keep = v
-			break
-		}
-	}
-	if keep == nil {
-		return
-	}
-	dropped := keep.prev
-	keep.prev = nil
-	if keep == h.head && keep.deleted { // 只剩一个对所有人都已生效的墓碑：整行可以删掉
-		tb.pri.Delete(pk)
-		h.head = nil
-	}
-	for d := dropped; d != nil; d = d.prev {
-		for _, sk := range d.sec {
-			if h.head == nil || !chainReferences(h, sk) {
-				tb.sec[sk.idx].Delete(concat(sk.key, pk))
+	var del []secKey
+	removeRow := false
+	tb.pri.Modify(pk, func(val any) {
+		h := val.(*rowHead)
+		var keep *rowVer
+		for v := h.head; v != nil; v = v.prev {
+			if ts := v.trx.commitTS.Load(); ts != 0 && ts <= oldest {
+				keep = v
+				break
 			}
 		}
+		if keep == nil {
+			return
+		}
+		dropped := keep.prev
+		keep.prev = nil
+		removeRow = keep == h.head && keep.deleted // 只剩一个对所有人都已生效的墓碑：整行可以删掉
+		for d := dropped; d != nil; d = d.prev {
+			for _, sk := range d.sec {
+				if removeRow || !chainReferences(h, sk) {
+					del = append(del, sk)
+				}
+			}
+		}
+	})
+	for _, sk := range del {
+		tb.sec[sk.idx].Delete(concat(sk.key, pk))
+	}
+	if removeRow {
+		tb.pri.DeleteIf(pk, func(v any) bool {
+			h := v.(*rowHead)
+			return h.head != nil && h.head.deleted && h.head.prev == nil
+		})
 	}
 }
 
@@ -1055,8 +1273,6 @@ func (e *Engine) StartPurger(interval time.Duration) (stop func()) {
 
 // LastLatest 返回索引 idx 上最大键对应的、最新且未删除的行（不管事务可见性）。
 func (e *Engine) LastLatest(tb *table, idx, pkWidth int) ([]byte, bool) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
 	c := &Cursor{e: e, tbl: tb, idx: idx, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}}
 	for ok := c.raw.seek(nil, seekLast); ok; ok = c.raw.step(-1) {
 		if row, ok2 := c.currentRow(c.pk()); ok2 {
@@ -1069,8 +1285,6 @@ func (e *Engine) LastLatest(tb *table, idx, pkWidth int) ([]byte, bool) {
 // RecordsInRange 估算索引 idx 上落在 [lo, hi] 内的条目数（最多数 limit 个）。lo/hi 可以是键的前缀。
 // 只用于优化器估算：不区分可见性，包含已删除/未提交的条目。
 func (e *Engine) RecordsInRange(tb *table, idx int, lo []byte, hasLo, loIncl bool, hi []byte, hasHi, hiIncl bool, limit int) (n int, truncated bool) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
 	c := &Cursor{e: e, tbl: tb, idx: idx, raw: rawCursor{t: tb.tree(idx)}}
 	var ok bool
 	switch {

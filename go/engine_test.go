@@ -478,9 +478,11 @@ func TestPurge(t *testing.T) {
 	}
 	chain := func(id int) int {
 		n := 0
-		for v := tb.head(pk4(id)).head; v != nil; v = v.prev {
-			n++
-		}
+		tb.withHead(pk4(id), func(h *rowHead) {
+			for v := h.head; v != nil; v = v.prev {
+				n++
+			}
+		})
 		return n
 	}
 	if chain(40) < 2 {

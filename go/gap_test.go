@@ -64,14 +64,13 @@ func TestGapRangeBlocksInsert(t *testing.T) {
 	if len(got) != 2 || got[0] != 20 || got[1] != 30 {
 		t.Fatalf("range read returned %v", got)
 	}
-	b := newTx(e, isoRepeatableRead)
 	// 被锁的间隙：(10,20) (20,30) (30,40)；不在其中：(-inf,10) (40,50) (50,+inf)
+	// 每个探针用独立的事务：一个事务同一时刻只能被一个 goroutine 使用（和 MySQL 的一个连接一个事务一致）
 	want := map[int]bool{12: true, 25: true, 35: true, 5: false, 45: false, 60: false}
 	pending := map[int]chan error{}
 	for id := range want {
-		pending[id] = insertAsync(e, b, tb, id)
+		pending[id] = insertAsync(e, newTx(e, isoRepeatableRead), tb, id)
 	}
-	// b 是同一个事务在多个 goroutine 里并发使用，仅用于测试阻塞与否；为避免干扰，逐个判断
 	for id, shouldBlock := range want {
 		if got := blocked(pending[id]); got != shouldBlock {
 			t.Errorf("insert id=%d: blocked=%v want %v", id, got, shouldBlock)

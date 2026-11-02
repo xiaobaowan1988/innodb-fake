@@ -155,15 +155,16 @@ func (tb *table) gapHolder(t *Txn, entries []gapEntry) *Txn {
 }
 
 // waitTxn 等待另一个事务结束（插入遇到间隙锁时用）。参与死锁检测，并受锁等待超时限制。
+// 调用者不得持有任何树锁、gapMu、条纹锁。
 func (lm *lockMgr) waitTxn(t, holder *Txn) error {
-	lm.mu.Lock()
+	lm.dmu.Lock()
 	t.blockedOn = []*Txn{holder}
 	if lm.deadlock(t) {
 		t.blockedOn = nil
-		lm.mu.Unlock()
+		lm.dmu.Unlock()
 		return ErrDeadlock
 	}
-	lm.mu.Unlock()
+	lm.dmu.Unlock()
 	var err error
 	timer := time.NewTimer(t.timeout)
 	select {
@@ -172,9 +173,9 @@ func (lm *lockMgr) waitTxn(t, holder *Txn) error {
 		err = ErrLockTimeout
 	}
 	timer.Stop()
-	lm.mu.Lock()
+	lm.dmu.Lock()
 	t.blockedOn = nil
-	lm.mu.Unlock()
+	lm.dmu.Unlock()
 	return err
 }
 

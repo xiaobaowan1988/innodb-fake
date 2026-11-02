@@ -41,9 +41,16 @@ type rawCursor struct {
 	vk    []byte // visit 回调捕获的结果
 	vv    any
 	visit func(k []byte, v any)
+	// hook 在叶子读锁内、对每个被访问到的条目调用：引擎用它在锁内解析版本链（链内容受叶子锁保护）。
+	hook func(k []byte, v any)
 }
 
-func (c *rawCursor) capture(k []byte, v any) { c.vk, c.vv = k, v }
+func (c *rawCursor) capture(k []byte, v any) {
+	c.vk, c.vv = k, v
+	if c.hook != nil {
+		c.hook(k, v)
+	}
+}
 
 func (c *rawCursor) visitFn() func(k []byte, v any) {
 	if c.visit == nil {
