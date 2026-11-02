@@ -47,7 +47,7 @@ def fmt(r): return r[0] + ":" + str(r[1])
 def fresh(c, ddl_extra=""):
     cur = pymysql.connect(unix_socket=c.a.socket, user="root", autocommit=True).cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS {c.db}"); cur.execute(f"USE {c.db}")
-    for t in ("t", "u", "ai", "g", "gu"): cur.execute(f"DROP TABLE IF EXISTS {t}")
+    for t in ("t", "u", "ai", "g", "gu", "gw"): cur.execute(f"DROP TABLE IF EXISTS {t}")
     cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, k INT, KEY(k)) ENGINE=__E__".replace("__E__", c.eng))
     cur.execute("INSERT INTO t VALUES (1,10,1),(2,20,2),(3,30,3)")
     cur.execute("CREATE TABLE u (id INT PRIMARY KEY, e INT, UNIQUE KEY ue(e)) ENGINE=__E__".replace("__E__", c.eng))
@@ -57,6 +57,8 @@ def fresh(c, ddl_extra=""):
     cur.execute("INSERT INTO g VALUES (10,1),(20,2),(30,3),(40,4),(50,5)")
     cur.execute("CREATE TABLE gu (id INT PRIMARY KEY, e INT, UNIQUE KEY ue(e)) ENGINE=__E__".replace("__E__", c.eng))
     cur.execute("INSERT INTO gu VALUES (10,1),(20,2),(30,3),(40,4),(50,5)")
+    cur.execute("CREATE TABLE gw (id INT PRIMARY KEY, e INT, v INT, UNIQUE KEY we(e)) ENGINE=__E__".replace("__E__", c.eng))
+    cur.execute("INSERT INTO gw VALUES (10,1,0),(20,2,0),(30,3,0)")
 
 SC = {}
 def scenario(f): SC[f.__name__] = f; return f
@@ -539,6 +541,28 @@ def unique_dup_error_keeps_shared_lock(c):
     c.run("A", "BEGIN"); c.run("A", "INSERT INTO gu VALUES (11, 1)")                 # gu.e 唯一，(10,1) 已存在 -> 重复
     c.run("B", "DELETE FROM gu WHERE id=10")                                          # 被 A 的 S 锁挡住（收尾解除）
     c.run("A", "INSERT INTO gu VALUES (12, 1)")                                       # 重试：仍是重复
+    c.run("A", "ROLLBACK")
+
+@scenario
+def entry_lock_dup_error_only_blocks_indexed_changes(c):
+    # 重复错误只在冲突的唯一条目上留 S 锁：只改非索引列的 UPDATE 不被挡，改唯一列/删除才被挡
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (11, 1, 0)")               # 与 (10,1,0) 的 e 重复
+    c.run("B", "UPDATE gw SET v=5 WHERE id=10")                                        # 非索引列：不被挡
+    c.run("B", "UPDATE gw SET e=9 WHERE id=10")                                        # 改唯一列：被挡
+    c.run("B", "DELETE FROM gw WHERE id=10")                                           # 删除：被挡
+    c.run("A", "ROLLBACK")
+
+@scenario
+def entry_lock_dup_check_ignores_pk_lock_holder(c):
+    # 别人经主键持有该行 X 锁（没动唯一条目）：重复检查直接报重复，不等
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "SELECT * FROM gw WHERE id=10 FOR UPDATE")
+    c.run("B", "INSERT INTO gw VALUES (11, 1, 0)")
+    c.run("A", "UPDATE gw SET v=7 WHERE id=10")                                        # 未提交地只改非索引列
+    c.run("B", "INSERT INTO gw VALUES (12, 1, 0)")                                     # 仍然直接报重复
+    c.run("A", "UPDATE gw SET e=8 WHERE id=10")                                        # 未提交地改了唯一列
+    c.run("B", "INSERT INTO gw VALUES (13, 1, 0)")                                     # 要等 A（收尾解除）
     c.run("A", "ROLLBACK")
 
 if __name__ == "__main__":

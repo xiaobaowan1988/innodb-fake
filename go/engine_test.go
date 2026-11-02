@@ -935,3 +935,101 @@ func TestUniqueDupHoldsSharedLockOnConflictRow(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func blockedFor(f func() error) (blocked bool, err error) {
+	ch := make(chan error, 1)
+	go func() { ch <- f() }()
+	select {
+	case err := <-ch:
+		return false, err
+	case <-time.After(150 * time.Millisecond):
+		return true, nil
+	}
+}
+
+// 条目级行锁：重复错误只在冲突的唯一条目上留 S 锁——只改非索引列的更新不被挡，改唯一列或删除才被挡。
+func TestEntryLockGranularity(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	e.Insert(s, tb, pk4(1), row8(7), secs(7, true))
+	e.Commit(s)
+	a := e.Begin(isoRepeatableRead)
+	var d DupError
+	if err := e.Insert(a, tb, pk4(2), row8(7), secs(7, true)); !errors.As(err, &d) {
+		t.Fatalf("want dup, got %v", err)
+	}
+	// 只改非索引列：唯一条目不变 -> 不被挡
+	b := e.Begin(isoRepeatableRead)
+	if blk, err := blockedFor(func() error { return e.Update(b, tb, pk4(1), pk4(1), row8(99), secs(7, true)) }); blk || err != nil {
+		t.Fatalf("non-indexed update must not be blocked (blocked=%v err=%v)", blk, err)
+	}
+	e.Commit(b)
+	// 改唯一列 -> 被挡
+	c := e.Begin(isoRepeatableRead)
+	res := make(chan error, 1)
+	go func() { res <- e.Update(c, tb, pk4(1), pk4(1), row8(8), secs(8, true)) }()
+	select {
+	case err := <-res:
+		t.Fatalf("changing the unique column must wait, got %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	e.Commit(a)
+	if err := <-res; err != nil {
+		t.Fatal(err)
+	}
+	e.Commit(c)
+	// 删除 -> 被挡
+	a2 := e.Begin(isoRepeatableRead)
+	if err := e.Insert(a2, tb, pk4(3), row8(8), secs(8, true)); !errors.As(err, &d) {
+		t.Fatalf("want dup, got %v", err)
+	}
+	dl := e.Begin(isoRepeatableRead)
+	if blk, _ := blockedFor(func() error { return e.Delete(dl, tb, pk4(1)) }); !blk {
+		t.Fatal("delete of the conflicting row must wait")
+	}
+	e.Rollback(a2)
+}
+
+// 重复检查不等"只持有主键行锁"的别人，也不等只改了非索引列的未提交更新；等的是改变了唯一条目的未提交事务。
+func TestDupCheckWaitsOnlyForEntryChangers(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	e.Insert(s, tb, pk4(1), row8(7), secs(7, true))
+	e.Commit(s)
+	var d DupError
+	// 别人用主键行锁（X）持有该行，没改唯一条目
+	h := e.Begin(isoRepeatableRead)
+	if _, err := e.GetRow(h, tb, pk4(1), lockX); err != nil {
+		t.Fatal(err)
+	}
+	x := e.Begin(isoRepeatableRead)
+	if blk, err := blockedFor(func() error { return e.Insert(x, tb, pk4(2), row8(7), secs(7, true)) }); blk || !errors.As(err, &d) {
+		t.Fatalf("pk-X holder must not block the dup check (blocked=%v err=%v)", blk, err)
+	}
+	// 别人未提交地只改了非索引列
+	if err := e.Update(h, tb, pk4(1), pk4(1), row8(50), secs(7, true)); err != nil {
+		t.Fatal(err)
+	}
+	y := e.Begin(isoRepeatableRead)
+	if blk, err := blockedFor(func() error { return e.Insert(y, tb, pk4(3), row8(7), secs(7, true)) }); blk || !errors.As(err, &d) {
+		t.Fatalf("uncommitted non-indexed update must not block (blocked=%v err=%v)", blk, err)
+	}
+	e.Rollback(x)
+	e.Rollback(y) // 它们的重复错误 S 锁要先放掉，否则 h 改唯一列会（正确地）被挡
+	// 别人未提交地改了唯一列：要等；它提交后 7 空出来，插入成功
+	if err := e.Update(h, tb, pk4(1), pk4(1), row8(50), secs(8, true)); err != nil {
+		t.Fatal(err)
+	}
+	z := e.Begin(isoRepeatableRead)
+	res := make(chan error, 1)
+	go func() { res <- e.Insert(z, tb, pk4(4), row8(7), secs(7, true)) }()
+	select {
+	case err := <-res:
+		t.Fatalf("must wait for the txn that changed the unique entry, got %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	e.Commit(h)
+	if err := <-res; err != nil {
+		t.Fatalf("after the change commits, key 7 is free: %v", err)
+	}
+}

@@ -52,7 +52,8 @@ const killPoll = 100 * time.Millisecond
 // DupError 表示唯一键冲突；Idx 是冲突的索引号（0 为主键）。
 type DupError struct {
 	Idx int
-	Pk  []byte // 唯一二级索引冲突时，冲突行的主键（用来在其上保留 S 锁）
+	Key []byte // 唯一二级索引冲突时，冲突条目的索引键部分
+	Pk  []byte // 冲突行的主键；(Idx, Key+Pk) 就是要保留 S 锁的条目
 }
 
 func (e DupError) Error() string { return "myengine: duplicate key" }
@@ -450,9 +451,11 @@ func (t *Txn) pushOn(tb *table, pk []byte, h *rowHead, v *rowVer) {
 
 // ---------------------------------------------------------------- 行锁管理器（分片）
 
+// lockKey 标识一把行锁。idx==0：主键行锁（key 是主键）；idx>0：唯一二级索引条目锁（key 是索引键+主键）。
 type lockKey struct {
 	tbl *table
-	pk  string
+	idx int
+	key string
 }
 
 // waiter 是行锁等待队列里的一项。位置在被唤醒后保持不变（唤醒后重新判断，不是重新排到队尾），
@@ -497,11 +500,11 @@ var (
 
 func (lm *lockMgr) shard(key lockKey) *lockShard {
 	h := uint32(2166136261)
-	for i := 0; i < len(key.pk); i++ {
-		h ^= uint32(key.pk[i])
+	for i := 0; i < len(key.key); i++ {
+		h ^= uint32(key.key[i])
 		h *= 16777619
 	}
-	h ^= key.tbl.id * 2654435761
+	h ^= key.tbl.id*2654435761 + uint32(key.idx)*40503
 	h *= 16777619
 	return &lm.shards[h%lmShards]
 }
@@ -547,7 +550,15 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 // lockPolicy 按到达顺序排队取锁：新请求除了被冲突的持有者阻塞，还被排在它前面的、与它冲突的等待者阻塞。
 // 例外：锁升级（已持有 S 再请求 X）不排队，只被其它持有者阻塞——否则"A 持 S，B 等 X，A 升级 X"会被人为地造成死锁。
 func (lm *lockMgr) lockPolicy(t *Txn, tb *table, pk []byte, mode, policy int) error {
-	key := lockKey{tb, string(pk)}
+	return lm.lockKeyPolicy(t, lockKey{tb, 0, string(pk)}, mode, policy)
+}
+
+// lockEntry 锁唯一二级索引的一个条目（entry = 索引键 + 主键）。
+func (lm *lockMgr) lockEntry(t *Txn, tb *table, idx int, entry []byte, mode int) error {
+	return lm.lockKeyPolicy(t, lockKey{tb, idx, string(entry)}, mode, waitNormal)
+}
+
+func (lm *lockMgr) lockKeyPolicy(t *Txn, key lockKey, mode, policy int) error {
 	sh := lm.shard(key)
 	var deadline time.Time
 	var w *waiter // 一旦入队就保持，直到授予或放弃
@@ -663,7 +674,7 @@ func (lm *lockMgr) clearWait(t *Txn, waited bool) {
 
 // tryLock 不阻塞地尝试取行锁，取不到返回 false（purge 用）。有人在排队时也让路，不去插队。
 func (lm *lockMgr) tryLock(t *Txn, tb *table, pk []byte, mode int) bool {
-	key := lockKey{tb, string(pk)}
+	key := lockKey{tb, 0, string(pk)}
 	sh := lm.shard(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -723,7 +734,7 @@ func (lm *lockMgr) deadlock(t *Txn) bool {
 
 // release 放掉 t 在某一行上的锁（仅用于确认没有留下任何版本的失败插入）。
 func (lm *lockMgr) release(t *Txn, tb *table, pk []byte) {
-	key := lockKey{tb, string(pk)}
+	key := lockKey{tb, 0, string(pk)}
 	sh := lm.shard(key)
 	sh.mu.Lock()
 	if rl := sh.locks[key]; rl != nil {
@@ -740,7 +751,7 @@ func (lm *lockMgr) release(t *Txn, tb *table, pk []byte) {
 
 // downgrade 把 t 持有的 X 降为 S 并唤醒等待者（仅用于刚取得 X、尚未改动该行的情形）。
 func (lm *lockMgr) downgrade(t *Txn, tb *table, pk []byte) {
-	key := lockKey{tb, string(pk)}
+	key := lockKey{tb, 0, string(pk)}
 	sh := lm.shard(key)
 	sh.mu.Lock()
 	if rl := sh.locks[key]; rl != nil && rl.x == t {
@@ -812,9 +823,36 @@ func (e *Engine) lockUniqueStripes(tb *table, sec []secKey) func() {
 
 // ---------------------------------------------------------------- 写操作
 
+// entryChanger 返回"让条目 (idx,key) 处于当前状态"的那个未提交的别的事务；没有则 nil。
+// 条目是否存在 = 版本未删除且带有这个键。沿版本链找到与链头状态相同的最老版本，它的作者就是造成当前状态的事务：
+// 只改非索引列的未提交更新不改变条目状态，所以不会被算进去。
+func entryChanger(h *rowHead, t *Txn, idx int, key []byte) *Txn {
+	has := func(v *rowVer) bool {
+		if v.deleted {
+			return false
+		}
+		for _, s := range v.sec {
+			if s.idx == idx && bytes.Equal(s.key, key) {
+				return true
+			}
+		}
+		return false
+	}
+	cur := h.head
+	m := has(cur)
+	for cur.prev != nil && has(cur.prev) == m {
+		cur = cur.prev
+	}
+	if cur.trx != t && cur.trx.commitTS.Load() == 0 {
+		return cur.trx
+	}
+	return nil
+}
+
 // checkUnique 检查唯一二级索引。skip 是应忽略的主键（自己和被更新的旧行）。
-// 返回 wait != nil 表示必须先等待该行上的另一个活跃事务结束，再重新检查。调用者已持有相关的条纹锁。
-func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wait []byte, err error) {
+// 条目是被别的未提交事务改变的：返回那个事务让调用者等它结束；与已提交（或自己的）行冲突：返回 DupError。
+// 调用者持有唯一条纹锁，所以这里不能等锁。
+func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wait *Txn, err error) {
 	for _, sk := range sec {
 		if !sk.unique {
 			continue
@@ -830,17 +868,17 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 				if h == nil {
 					return
 				}
-				v := h.head
-				if v.trx != t && v.trx.commitTS.Load() == 0 {
-					wait = cpk // 另一个活跃事务改过这一行：等它结束
+				if w := entryChanger(h, t, sk.idx, sk.key); w != nil {
+					wait = w
 					return
 				}
+				v := h.head
 				if v.deleted {
 					return
 				}
 				for _, s := range v.sec {
 					if s.idx == sk.idx && bytes.Equal(s.key, sk.key) {
-						err = DupError{Idx: sk.idx, Pk: append([]byte(nil), cpk...)}
+						err = DupError{Idx: sk.idx, Key: append([]byte(nil), sk.key...), Pk: append([]byte(nil), cpk...)}
 						return
 					}
 				}
@@ -854,6 +892,40 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 	return nil, nil
 }
 
+// lockOldEntries 在旧行即将改变的唯一二级索引条目上取 X 锁（InnoDB 删除标记这些条目时也会锁它们）。
+// 这样别人因重复错误持有的条目 S 锁能挡住这里的 DELETE / 改唯一列，而只改非索引列的更新不受影响。
+// 调用者已持有该行主键 X 锁，所以旧版本不会被别人改动。keep 是新行仍然保留的条目。
+func (e *Engine) lockOldEntries(t *Txn, tb *table, pk []byte, keep []secKey) error {
+	var old []secKey
+	tb.withHead(pk, func(h *rowHead) {
+		if h == nil || h.head == nil || h.head.deleted {
+			return
+		}
+		for _, sk := range h.head.sec {
+			if !sk.unique {
+				continue
+			}
+			kept := false
+			for _, k := range keep {
+				if k.idx == sk.idx && bytes.Equal(k.key, sk.key) {
+					kept = true
+					break
+				}
+			}
+			if !kept {
+				old = append(old, sk)
+			}
+		}
+	})
+	sort.SliceStable(old, func(i, j int) bool { return old[i].idx < old[j].idx })
+	for _, sk := range old {
+		if err := e.lm.lockEntry(t, tb, sk.idx, concat(sk.key, pk), lockX); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // holdDup：唯一二级索引冲突时，InnoDB 在冲突行上保留 S 锁到事务结束（重复错误因此可重复）。
 // 返回 true 表示刚取得了 S 锁、需要重新检查；false 表示此前已持有，可以直接报错。
 func (e *Engine) holdDup(t *Txn, tb *table, err error) (bool, error) {
@@ -861,10 +933,11 @@ func (e *Engine) holdDup(t *Txn, tb *table, err error) (bool, error) {
 	if !ok || d.Pk == nil {
 		return false, nil
 	}
-	if _, held := t.held[lockKey{tb, string(d.Pk)}]; held {
+	entry := concat(d.Key, d.Pk)
+	if _, held := t.held[lockKey{tb, d.Idx, string(entry)}]; held {
 		return false, nil
 	}
-	if lerr := e.lm.lock(t, tb, d.Pk, lockS); lerr != nil {
+	if lerr := e.lm.lockEntry(t, tb, d.Idx, entry, lockS); lerr != nil {
 		return false, lerr
 	}
 	return true, nil
@@ -878,7 +951,7 @@ func putSecEntries(tb *table, pk []byte, v *rowVer) {
 }
 
 func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
-	_, had := t.held[lockKey{tb, string(pk)}]
+	_, had := t.held[lockKey{tb, 0, string(pk)}]
 	// 先不加锁看一眼：主键上已有活行时，InnoDB 只在它上面取 S 锁并报重复，两个同样重复的插入互不阻塞。
 	// 这只是个提示；取到 S 后重新确认，若行已消失就照常走 X 路径。
 	liveNow := func() (l bool) {
@@ -933,7 +1006,7 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 		}
 		if wait != nil {
 			unlockU()
-			if err := e.lm.lock(t, tb, wait, lockS); err != nil {
+			if err := e.lm.waitTxn(t, wait); err != nil {
 				return err
 			}
 			continue
@@ -988,6 +1061,13 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 			return err
 		}
 	}
+	keep := sec
+	if !same {
+		keep = nil
+	}
+	if err := e.lockOldEntries(t, tb, oldpk, keep); err != nil {
+		return err
+	}
 	for {
 		unlockU := e.lockUniqueStripes(tb, sec)
 		oldLive := false
@@ -1021,7 +1101,7 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 		}
 		if wait != nil {
 			unlockU()
-			if err := e.lm.lock(t, tb, wait, lockS); err != nil {
+			if err := e.lm.waitTxn(t, wait); err != nil {
 				return err
 			}
 			continue
@@ -1068,6 +1148,9 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 
 func (e *Engine) Delete(t *Txn, tb *table, pk []byte) error {
 	if err := e.lm.lock(t, tb, pk, lockX); err != nil {
+		return err
+	}
+	if err := e.lockOldEntries(t, tb, pk, nil); err != nil {
 		return err
 	}
 	tb.pri.Modify(pk, func(v any) {
@@ -1375,7 +1458,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		}
 		pk := c.pk()
 		deadKey := c.raw.key
-		_, had := c.t.held[lockKey{c.tbl, string(pk)}]
+		_, had := c.t.held[lockKey{c.tbl, 0, string(pk)}]
 		// 加锁读：此刻没有持有任何树锁/gapMu，可以安全地等行锁；醒来后树可能变了，游标会按 key 重新定位
 		if err := e.lm.lockPolicy(c.t, c.tbl, pk, c.lock, c.policy); err != nil {
 			if errors.Is(err, errSkipRow) { // SKIP LOCKED：这一行被别人锁着，跳过，取下一行
