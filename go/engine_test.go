@@ -806,3 +806,26 @@ func TestSnapshotIsTakenImmediately(t *testing.T) {
 		t.Fatalf("snapshot must predate the later commit, saw %d", v)
 	}
 }
+
+// 唯一键冲突而失败的插入不能在主键上留下行锁（InnoDB 回滚掉的插入不留锁）。
+func TestFailedInsertLeavesNoRowLock(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	e.Insert(s, tb, pk4(1), row8(7), secs(7, true))
+	e.Commit(s)
+	a, b := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	var d DupError
+	if err := e.Insert(a, tb, pk4(5), row8(7), secs(7, true)); !errors.As(err, &d) {
+		t.Fatalf("want dup, got %v", err)
+	}
+	res := make(chan error, 1)
+	go func() { res <- e.Insert(b, tb, pk4(5), row8(8), secs(8, true)) }()
+	select {
+	case err := <-res:
+		if err != nil {
+			t.Fatalf("b must succeed, got %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("b blocked on a row lock left by a's failed insert")
+	}
+}

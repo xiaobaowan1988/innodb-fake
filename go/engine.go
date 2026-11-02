@@ -718,6 +718,23 @@ func (lm *lockMgr) deadlock(t *Txn) bool {
 	return dfs(t)
 }
 
+// release 放掉 t 在某一行上的锁（仅用于确认没有留下任何版本的失败插入）。
+func (lm *lockMgr) release(t *Txn, tb *table, pk []byte) {
+	key := lockKey{tb, string(pk)}
+	sh := lm.shard(key)
+	sh.mu.Lock()
+	if rl := sh.locks[key]; rl != nil {
+		if rl.x == t {
+			rl.x = nil
+		}
+		delete(rl.s, t)
+		lm.wakeAll(rl)
+		sh.cleanup(key, rl)
+	}
+	sh.mu.Unlock()
+	delete(t.held, key)
+}
+
 func (lm *lockMgr) releaseAll(t *Txn) {
 	for key := range t.held {
 		sh := lm.shard(key)
@@ -829,6 +846,7 @@ func putSecEntries(tb *table, pk []byte, v *rowVer) {
 }
 
 func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
+	_, had := t.held[lockKey{tb, string(pk)}]
 	if err := e.lm.lock(t, tb, pk, lockX); err != nil {
 		return err
 	}
@@ -847,6 +865,11 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 		wait, err := e.checkUnique(t, tb, [][]byte{pk}, sec)
 		if err != nil {
 			unlockU()
+			// 唯一键冲突导致插入失败，而这个主键上并没有活的行：InnoDB 里回滚掉的插入不留锁，
+			// 这里也把本次新取的 X 锁放掉，否则别的事务会无谓地等在一个不存在的行上。
+			if !had {
+				e.lm.release(t, tb, pk)
+			}
 			return err
 		}
 		if wait != nil {
