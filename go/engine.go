@@ -735,6 +735,19 @@ func (lm *lockMgr) release(t *Txn, tb *table, pk []byte) {
 	delete(t.held, key)
 }
 
+// downgrade 把 t 持有的 X 降为 S 并唤醒等待者（仅用于刚取得 X、尚未改动该行的情形）。
+func (lm *lockMgr) downgrade(t *Txn, tb *table, pk []byte) {
+	key := lockKey{tb, string(pk)}
+	sh := lm.shard(key)
+	sh.mu.Lock()
+	if rl := sh.locks[key]; rl != nil && rl.x == t {
+		rl.x = nil
+		rl.s[t] = struct{}{}
+		lm.wakeAll(rl)
+	}
+	sh.mu.Unlock()
+}
+
 func (lm *lockMgr) releaseAll(t *Txn) {
 	for key := range t.held {
 		sh := lm.shard(key)
@@ -847,6 +860,24 @@ func putSecEntries(tb *table, pk []byte, v *rowVer) {
 
 func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 	_, had := t.held[lockKey{tb, string(pk)}]
+	// 先不加锁看一眼：主键上已有活行时，InnoDB 只在它上面取 S 锁并报重复，两个同样重复的插入互不阻塞。
+	// 这只是个提示；取到 S 后重新确认，若行已消失就照常走 X 路径。
+	liveNow := func() (l bool) {
+		tb.pri.GetFn(pk, func(v any) {
+			if h := v.(*rowHead); h.head != nil && !h.head.deleted {
+				l = true
+			}
+		})
+		return
+	}
+	if !had && liveNow() {
+		if err := e.lm.lock(t, tb, pk, lockS); err != nil {
+			return err
+		}
+		if liveNow() {
+			return DupError{0}
+		}
+	}
 	if err := e.lm.lock(t, tb, pk, lockX); err != nil {
 		return err
 	}
@@ -860,6 +891,10 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 		})
 		if live {
 			unlockU()
+			// InnoDB 的主键重复错误只在已存在的行上留 S 锁；我们是先取的 X，这里降级，免得别的重复插入被无谓阻塞
+			if !had {
+				e.lm.downgrade(t, tb, pk)
+			}
 			return DupError{0}
 		}
 		wait, err := e.checkUnique(t, tb, [][]byte{pk}, sec)

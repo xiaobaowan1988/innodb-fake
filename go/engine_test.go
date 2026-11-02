@@ -829,3 +829,37 @@ func TestFailedInsertLeavesNoRowLock(t *testing.T) {
 		t.Fatal("b blocked on a row lock left by a's failed insert")
 	}
 }
+
+// 主键重复导致的失败插入只在已存在的行上留 S 锁：第二个同样重复的插入不应被阻塞，而要的是 X 的写者仍被挡住。
+func TestDupInsertKeepsOnlySharedLock(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	mustInsert(t, e, s, tb, 10, 1)
+	e.Commit(s)
+	a, b, w := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	var d DupError
+	if err := e.Insert(a, tb, pk4(10), row8(2), secs(2, false)); !errors.As(err, &d) {
+		t.Fatalf("want dup, got %v", err)
+	}
+	res := make(chan error, 1)
+	go func() { res <- e.Insert(b, tb, pk4(10), row8(3), secs(3, false)) }()
+	select {
+	case err := <-res:
+		if !errors.As(err, &d) {
+			t.Fatalf("b must get dup, got %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("second duplicate insert blocked by an X lock")
+	}
+	go func() { res <- e.Update(w, tb, pk4(10), pk4(10), row8(9), secs(9, false)) }()
+	select {
+	case err := <-res:
+		t.Fatalf("writer must wait for a's S lock, got %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	e.Commit(a)
+	e.Commit(b)
+	if err := <-res; err != nil {
+		t.Fatal(err)
+	}
+}
