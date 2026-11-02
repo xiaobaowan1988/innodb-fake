@@ -253,3 +253,26 @@ e.tmu、dmu、pmu 都是叶子锁，内部不再取别的锁
   **没有发现问题的审计项**也如实记录在上面 v7。
   **审计的局限**：只测了我想到的场景。没有覆盖的包括：LOCK TABLES 模式下的语句起点（`start_stmt` 与钩子的交互）、外键、
   存储过程里的游标在同一事务内读自己刚写的行（批量预取对"读到自己后来的修改"是异步的，InnoDB 的游标本来也是 asensitive）。
+- v8（第二轮并发逻辑审计：用户问"现在还有逻辑问题吗"）：
+  **方法**：把第一轮审计里自己承认"没覆盖"的区域，加上这次想到的 InnoDB 行为，逐个做成对照实验。
+  **没有问题**（与 InnoDB 一致）：`LOCK TABLES` 模式下带触发器的语句失败后的原子性、`KILL CONNECTION`、`ALTER TABLE`
+  （加列/加删索引/唯一键，行数与索引行数一致）、多表 `UPDATE/DELETE`、跨引擎事务（InnoDB + MyEngine 同一事务的 ROLLBACK/COMMIT）。
+  **发现 4 个真实问题**：
+  1. **锁队列不公平，写者可能被饿死**。A 持有 S 锁，B 请求 X 锁（等待），C 再请求 S 锁：InnoDB 让 C 排在 B 之后，
+     本引擎让 C 直接插队拿到。持续有人 `FOR SHARE` 读同一行时，写者永远拿不到锁。
+     修法：行锁请求按到达顺序排队。新请求除了被冲突的**持有者**阻塞，还被排在它前面的、与它冲突的**等待者**阻塞。
+     等待者的队列位置在被唤醒后保持不变（唤醒后重新判断，不是重新排到队尾）；等待者退出（超时/被 KILL/死锁牺牲者）时必须唤醒
+     同一把锁上的其他等待者，否则排在它后面的会一直睡下去。等待图的边要包含"前面的等待者"，这样环能被检测到。
+     **例外：锁升级（已持有 S 再请求 X）不排队**，只被其它持有者阻塞——否则"A 持 S，B 等 X，A 升级 X"会被我们人为地制造成死锁。
+     （InnoDB 在这种情形会报死锁 1213，本引擎会让 A 升级成功；这是有意的差异，结果更宽松且不会饿死。）
+  2. **`SELECT … FOR UPDATE NOWAIT / SKIP LOCKED` 不生效**，都一直阻塞。策略由 `store_lock` 里的
+     `table->pos_in_table_list->lock_descriptor().action`（`THR_NOWAIT` / `THR_SKIP`）给出。
+     修法：游标带等待策略（只对加锁读生效）；行锁请求需要等待时：NOWAIT 返回新错误码，C++ 按 InnoDB 的做法
+     `my_error(ER_LOCK_NOWAIT)` 并返回 `HA_ERR_NO_WAIT_LOCK`；SKIP LOCKED 则跳过这一行继续取下一行。
+  3. **`START TRANSACTION WITH CONSISTENT SNAPSHOT` 的快照没有在那一刻建立**（读到了之后别人提交的值）。
+     之前把它列为非目标，现在发现实现很小：实现 `hton->start_consistent_snapshot`，在 RR 下立即创建事务并建立视图。
+  4. **外键被静默忽略**：`CREATE TABLE … FOREIGN KEY` 成功，插入孤儿行也成功（InnoDB 报 1452）。这是静默的数据完整性丢失，
+     比"不支持"更糟。修法：`create()` 里发现表定义含外键就拒绝建表（`ER_ILLEGAL_HA_CREATE_OPTION`）。
+     （这是与"静默忽略外键"的 MyISAM 式行为不同的有意选择。）
+  **回归测试**：`txn_check.py` 增加队列公平、NOWAIT、SKIP LOCKED、一致性快照场景（与 InnoDB 对照）；
+  外键拒绝与锁升级例外没有 InnoDB 可对照，放在 Go 单测和 `concurrency_audit.py` 的断言里。
