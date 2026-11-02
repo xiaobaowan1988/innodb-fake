@@ -360,3 +360,12 @@ InnoDB 在每个索引条目上各加各的锁。后果：唯一键冲突检查�
 
 **验证**：Go 单测（写者在条目上被挡/不被挡、等未提交者的判断、死锁不挂、变异检查）、SQL 场景（对照 InnoDB）、
 把 v9 里那 5 个 seed 的最小复现加入回归、`-race`、`fuzz_diff.py` 重跑 0–99。
+
+**v10 结果**：实现与计划一致（`lockKey{tbl,idx,key}`、`lockEntry`、`lockOldEntries`、`entryChanger`、`DupError{Idx,Key,Pk}`）。
+Go 单测 `TestEntryLockGranularity`、`TestDupCheckWaitsOnlyForEntryChangers`（拿掉"写者锁条目"或"按条目判断等待"任一项都会失败）；
+SQL 场景 63/63 与 InnoDB 一致（新增 `entry_lock_dup_error_only_blocks_indexed_changes`、`entry_lock_dup_check_ignores_pk_lock_holder`）；
+216 个结果集、并发检查、`concurrency_audit.py`、`-race` 全部通过。
+`fuzz_diff.py` seed 0–99：有差异的 seed 从 26 个降到 24 个；v9 里归为"整行锁 vs 条目锁"的 8、52、58、80、87、96 以及 35 都不再出现。
+注意：fuzzer 对探测窗口（0.3s）敏感，个别 seed 在整批里有差异、单独重跑却一致（如 93、40），所以 seed 集合每次会有 ±几个的波动，不能当作确定性结论。
+**仍然存在的差异**：插入顺序类（InnoDB 先插主键）、唯一键重复错误在二级唯一索引上的间隙锁、扫描经二级索引时不锁索引条目、
+非唯一二级索引没有条目锁、死锁牺牲者选择。
