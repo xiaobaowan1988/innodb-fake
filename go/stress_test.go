@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -325,5 +326,135 @@ func TestStressPurgeVsSameKeyUpdates(t *testing.T) {
 	wg.Wait()
 	if bad.Load() != 0 {
 		t.Fatalf("%d secondary-index scans lost rows (purge removed an entry that a live version still needed)", bad.Load())
+	}
+}
+
+//  6. 批量预取的随机游走：随机定位、随机正反向单步（含缓冲耗尽、方向翻转、已提交删除留下的不可见墓碑），
+//     结果必须与排序数组一致。
+func TestBatchedSnapshotWalkMatchesOracle(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	for i := 0; i < 300; i++ {
+		mustInsert(t, e, s, tb, i, i)
+	}
+	e.Commit(s)
+	d := e.Begin(isoRepeatableRead)
+	live := []int{}
+	for i := 0; i < 300; i++ {
+		if i%7 == 3 || i%11 == 5 { // 一批已提交的删除：墓碑留在树里，对之后的快照不可见
+			e.Delete(d, tb, pk4(i))
+		} else {
+			live = append(live, i)
+		}
+	}
+	e.Commit(d)
+	rng := rand.New(rand.NewSource(21))
+	for trial := 0; trial < 400; trial++ {
+		a := newTx(e, isoRepeatableRead)
+		c := e.OpenCursor(a, tb, 0, lockNone, 4)
+		target := rng.Intn(310)
+		pos := sort.SearchInts(live, target)
+		r, err := c.Seek(pk4(target), seekGE)
+		if pos >= len(live) {
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("seek past end: %v", err)
+			}
+			e.Commit(a)
+			continue
+		}
+		if err != nil || rowVal(r) != live[pos] {
+			t.Fatalf("seek %d: got %v %v want %d", target, r, err, live[pos])
+		}
+		for step := 0; step < 80; step++ {
+			dir := 1
+			if rng.Intn(3) == 0 {
+				dir = -1
+			}
+			np := pos + dir
+			r, err = c.Step(dir)
+			if np < 0 || np >= len(live) {
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("trial %d: step %d from pos %d should hit the end, got %v %v", trial, dir, pos, r, err)
+				}
+				break
+			}
+			if err != nil || rowVal(r) != live[np] {
+				t.Fatalf("trial %d: step %d from %d: got %v %v want %d", trial, dir, live[pos], r, err, live[np])
+			}
+			pos = np
+		}
+		e.Commit(a)
+	}
+}
+
+// 7) 快照扫描必须精确等于"快照时刻"的内容，即使别的事务在同时大量提交修改（预取缓冲不能把后来提交的东西带进来）。
+func TestBatchedSnapshotScanIgnoresConcurrentCommits(t *testing.T) {
+	e, tb := newTestEngine(t)
+	const n = 400
+	s := e.Begin(isoRepeatableRead)
+	for i := 0; i < n; i++ {
+		mustInsert(t, e, s, tb, i*2, i*2) // 偶数 id，值 = id
+	}
+	e.Commit(s)
+	stopPurge := e.StartPurger(time.Millisecond)
+	defer stopPurge()
+	reader := e.Begin(isoRepeatableRead)
+	reader.StmtBegin(isoRepeatableRead)
+	if _, err := e.GetRow(reader, tb, pk4(0), lockNone); err != nil { // 建立快照
+		t.Fatal(err)
+	}
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(w) + 300))
+			for !stop.Load() {
+				tx := e.Begin(isoRepeatableRead)
+				tx.StmtBegin(isoRepeatableRead)
+				id := rng.Intn(n * 2)
+				switch rng.Intn(3) {
+				case 0:
+					e.Insert(tx, tb, pk4(id|1), row8(-1), secs(1, false)) // 奇数 id：快照里不存在
+				case 1:
+					e.Delete(tx, tb, pk4(id&^1))
+				default:
+					e.Update(tx, tb, pk4(id&^1), pk4(id&^1), row8(-5), secs(5, false))
+				}
+				e.Commit(tx)
+			}
+		}(w)
+	}
+	bad := 0
+	for round := 0; round < 150; round++ {
+		for _, dir := range []int{1, -1} {
+			c := e.OpenCursor(reader, tb, 0, lockNone, 4)
+			var r []byte
+			var err error
+			if dir > 0 {
+				r, err = c.Seek(nil, seekFirst)
+			} else {
+				r, err = c.Seek(nil, seekLast)
+			}
+			cnt, prev := 0, -1
+			for err == nil {
+				v := rowVal(r)
+				if v < 0 || v%2 != 0 || (prev != -1 && ((dir > 0 && v <= prev) || (dir < 0 && v >= prev))) {
+					bad++
+				}
+				prev = v
+				cnt++
+				r, err = c.Step(dir)
+			}
+			if cnt != n {
+				bad++
+			}
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+	if bad != 0 {
+		t.Fatalf("%d snapshot scans deviated from the snapshot taken at the start", bad)
 	}
 }

@@ -131,6 +131,21 @@ func (c *rawCursor) step(dir int) bool {
 	return c.setFrom(c.t.StepFrom(c.loc, dir, c.key, c.visitFn()))
 }
 
+// stepBatch 批量预取：沿 dir 在同一个叶子里最多取 max 个条目，每个条目在叶子读锁内调用 visit。
+// 返回取到的条目数；游标位置移到批末（loc），调用者负责维护 c.key。
+func (c *rawCursor) stepBatch(dir, max int, visit func(k []byte, v any)) int {
+	if !c.valid {
+		return 0
+	}
+	loc, n := c.t.StepBatch(c.loc, dir, c.key, max, visit)
+	if n == 0 {
+		c.valid = false
+		return 0
+	}
+	c.loc = loc
+	return n
+}
+
 // 物理邻居的键（用于登记间隙）。每次都是一次独立的下探，只在加锁范围扫描时使用。
 func (c *rawCursor) prevKey() ([]byte, bool) { return keyAt(c.t, locLT, c.key) }
 func (c *rawCursor) nextKey() ([]byte, bool) { return keyAt(c.t, locGT, c.key) }

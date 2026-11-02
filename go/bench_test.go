@@ -137,3 +137,23 @@ func BenchmarkEngineMixed90_10(b *testing.B) {
 		}
 	})
 }
+
+// 二级索引上的一致性读：每个二级条目要回主索引取行（先在二级树上走一步，再去主索引下探）。
+// 每个二级键对应 100 行（benchRows/1000）。
+func BenchmarkEngineSecondaryScan100(b *testing.B) {
+	e, tb := benchEngine(b)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(rand.Int63()))
+		tx := e.Begin(isoRepeatableRead)
+		tx.StmtBegin(isoRepeatableRead)
+		for pb.Next() {
+			c := e.OpenCursor(tx, tb, 1, lockNone, 4)
+			_, err := c.Seek(pk4(rng.Intn(1000)), seekExact)
+			for err == nil {
+				_, err = c.Step(1)
+			}
+		}
+		e.Commit(tx)
+	})
+}

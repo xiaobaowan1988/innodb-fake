@@ -44,6 +44,13 @@ func init() {
 		if f, err := os.Create(p); err == nil {
 			profFile = f
 			pprof.StartCPUProfile(f)
+			// mysqld 没有机会调用 MyEngine_ProfileStop：设置 MYENGINE_CPUPROFILE_SECS 让库在 N 秒后自动停止并写出文件
+			if n, err := strconv.Atoi(os.Getenv("MYENGINE_CPUPROFILE_SECS")); err == nil && n > 0 {
+				go func() {
+					time.Sleep(time.Duration(n) * time.Second)
+					MyEngine_ProfileStop()
+				}()
+			}
 		}
 	}
 }

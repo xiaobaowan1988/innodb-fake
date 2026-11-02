@@ -435,8 +435,9 @@ func (t *BTree) Locate(op int, key []byte, visit func(key []byte, val any)) (Loc
 	return t.locateLocked(op, key, visit)
 }
 
-// locateLocked：调用者持有 smo 读锁。
-func (t *BTree) locateLocked(op int, key []byte, visit func(key []byte, val any)) (Loc, bool) {
+// positionLocked 按 op 定位到一个条目，成功时返回持有读锁的叶子和下标（调用者负责释放），否则返回 nil。
+// 调用者持有 smo 读锁。
+func (t *BTree) positionLocked(op int, key []byte) (*node, int) {
 	var n *node
 	switch op {
 	case locFirst:
@@ -472,7 +473,7 @@ func (t *BTree) locateLocked(op int, key []byte, visit func(key []byte, val any)
 		}
 		n.mu.RUnlock()
 		if nb == nil {
-			return Loc{}, false
+			return nil, 0
 		}
 		n = nb
 		n.mu.RLock()
@@ -482,12 +483,80 @@ func (t *BTree) locateLocked(op int, key []byte, visit func(key []byte, val any)
 			i = len(n.keys) - 1
 		}
 	}
+	return n, i
+}
+
+// locateLocked：调用者持有 smo 读锁。
+func (t *BTree) locateLocked(op int, key []byte, visit func(key []byte, val any)) (Loc, bool) {
+	n, i := t.positionLocked(op, key)
+	if n == nil {
+		return Loc{}, false
+	}
 	if visit != nil {
 		visit(n.keys[i], n.vals[i])
 	}
 	loc := Loc{n, i, n.ver, t.epoch}
 	n.mu.RUnlock()
 	return loc, true
+}
+
+// StepBatch 从 loc 之后开始沿 dir 走，在**同一个叶子读锁内**最多对 max 个相邻条目调用 visit（不跨叶子）。
+// 返回最后一个被访问条目的 Loc 和访问的条目数；0 表示没有更多条目。
+// 位置失效（epoch 或叶子 ver 变了）时按 lastKey 重新下探。用于快照读的批量预取：
+// 摊薄每行的加锁次数，visit 里可以在锁内解析版本链。
+func (t *BTree) StepBatch(loc Loc, dir int, lastKey []byte, max int, visit func(key []byte, val any)) (Loc, int) {
+	t.smo.RLock()
+	defer t.smo.RUnlock()
+	var n *node
+	var i int
+	if loc.n != nil && loc.epoch == t.epoch {
+		ln := loc.n
+		ln.mu.RLock()
+		if ln.ver == loc.ver {
+			if j := loc.i + dir; j >= 0 && j < len(ln.keys) {
+				n, i = ln, j // 继续持有 ln 的读锁
+			} else {
+				nb := ln.prev
+				if dir > 0 {
+					nb = ln.next
+				}
+				ln.mu.RUnlock()
+				if nb == nil {
+					return Loc{}, 0
+				}
+				nb.mu.RLock()
+				jj := len(nb.keys) - 1
+				if dir > 0 {
+					jj = 0
+				}
+				if jj >= 0 && jj < len(nb.keys) {
+					n, i = nb, jj
+				} else {
+					nb.mu.RUnlock()
+				}
+			}
+		} else {
+			ln.mu.RUnlock()
+		}
+	}
+	if n == nil { // 慢路径：按上一个条目的键重新下探
+		op := locGT
+		if dir < 0 {
+			op = locLT
+		}
+		if n, i = t.positionLocked(op, lastKey); n == nil {
+			return Loc{}, 0
+		}
+	}
+	cnt, last := 0, i
+	for j := i; j >= 0 && j < len(n.keys) && cnt < max; j += dir {
+		visit(n.keys[j], n.vals[j])
+		cnt++
+		last = j
+	}
+	out := Loc{n, last, n.ver, t.epoch}
+	n.mu.RUnlock()
+	return out, cnt
 }
 
 // StepFrom 从 loc 沿 dir(+1/-1) 走一步。epoch 和叶子 ver 都没变时 O(1) 沿叶子链移动；

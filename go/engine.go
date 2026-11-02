@@ -936,6 +936,14 @@ type Cursor struct {
 	resRow []byte
 	resOK  bool
 
+	// 一致性读的批量预取缓冲：一次叶子读锁内取后面最多 16 个条目（主索引：同时解析可见版本；二级索引：只取键），后续 Step 直接从缓冲取，不碰树锁。
+	// 对快照读是安全的：我的视图下每个键能看到的版本是固定的，之后别人的修改对我本来就不可见。
+	buf     []batchEnt
+	bufPos  int
+	bufDir  int
+	batchFn func(k []byte, v any)
+	batchN  int // 下一次预取的大小：从 2 倍增到 16，避免 LIMIT 1 之类的短扫描白白多解析
+
 	// 扫描边界（见 gap.go）
 	bKind      int // 外部设置的边界（SetBound）
 	bKey       []byte
@@ -945,12 +953,68 @@ type Cursor struct {
 	autoPrefix []byte // Seek 在精确/前缀模式下自动设置的同键前缀边界；下一次非精确 Seek 会清掉，不影响外部边界
 }
 
+type batchEnt struct {
+	key []byte
+	row []byte // nil 表示对当前视图没有可见的、未删除的版本（真实的行数据永远非空）
+}
+
 func (e *Engine) OpenCursor(t *Txn, tb *table, idx, lock, pkWidth int) *Cursor {
-	c := &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx]}
+	c := &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx], batchN: 2}
 	if idx == 0 && lock == lockNone {
 		c.raw.hook = c.snapshotHook
 	}
 	return c
+}
+
+// batchVisit 在叶子读锁内被调用：解析一个条目对当前视图的可见版本，放进缓冲。
+func (c *Cursor) batchVisit(k []byte, val any) {
+	e := batchEnt{key: k}
+	if c.idx != 0 { // 二级索引：只批量取键；可见版本要回主索引解析，不能在二级树的叶子锁内做
+		c.buf = append(c.buf, e)
+		return
+	}
+	if h := val.(*rowHead); h.head != nil {
+		if v := h.visible(c.snapRV); v != nil && !v.deleted {
+			e.row = v.data
+		}
+	}
+	c.buf = append(c.buf, e)
+}
+
+// pop 从缓冲取下一个条目，作为当前候选（二级索引的 row 为 nil，由调用者回主索引解析）。
+func (c *Cursor) pop() bool {
+	e := c.buf[c.bufPos]
+	c.bufPos++
+	c.raw.key, c.raw.valid = e.key, true
+	c.resRow, c.resOK = e.row, e.row != nil
+	return true
+}
+
+// nextCandidate 沿 dir 取下一个候选。一致性读（主索引和二级索引）走批量预取缓冲，加锁读逐条取。
+func (c *Cursor) nextCandidate(dir int) bool {
+	if c.lock != lockNone {
+		return c.raw.step(dir)
+	}
+	if c.bufPos < len(c.buf) {
+		if c.bufDir == dir {
+			return c.pop()
+		}
+		// 方向变了：缓冲作废；游标的位置停在批末而不是当前返回的键，所以让位置失效，改按当前键重新下探
+		c.raw.loc = Loc{}
+	}
+	if c.buf == nil { // 一次分配到位，避免 2→4→8→16 的逐次扩容
+		c.buf = make([]batchEnt, 0, 16)
+		c.batchFn = c.batchVisit
+	}
+	c.buf, c.bufPos, c.bufDir = c.buf[:0], 0, dir
+	n := c.raw.stepBatch(dir, c.batchN, c.batchFn)
+	if c.batchN < 16 {
+		c.batchN *= 2
+	}
+	if n == 0 {
+		return false
+	}
+	return c.pop()
 }
 
 // snapshotHook 在叶子读锁内被调用：对主索引候选解析对当前视图可见的版本。
@@ -1033,6 +1097,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		// 唯一索引全键：精确查找，或范围以 >= K 开始（K 恰好存在时都只加记录锁，不锁它前面的间隙）
 		firstUniq = flags&seekUniqueFull != 0 && (mode == seekExact || mode == seekGE)
 		c.done = false
+		c.buf, c.bufPos, c.batchN = c.buf[:0], 0, 2
 	} else if c.done {
 		c.raw.valid = false
 		return nil, ErrNotFound
@@ -1062,7 +1127,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 			ok = c.raw.seek(key, rawMode)
 			isSeek = false
 		} else {
-			ok = c.raw.step(dir)
+			ok = c.nextCandidate(dir)
 		}
 		inRange := ok && !c.beyond(c.raw.key)                          // 候选存在且没有越过扫描边界
 		hit := firstUniq && inRange && bytes.HasPrefix(c.raw.key, key) // 唯一全键恰好命中

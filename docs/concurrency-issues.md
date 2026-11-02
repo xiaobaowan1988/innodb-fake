@@ -14,14 +14,25 @@
 `FOR UPDATE/SHARE` 阻塞、SERIALIZABLE、死锁、回滚、语句原子性、SAVEPOINT、唯一冲突等待、自增、UPSERT/REPLACE、
 autocommit=0、断连回滚、锁等待超时），MyEngine 与 InnoDB 的执行过程逐行一致。
 
+## 间隙锁与物理并发（已解决）
+- **间隙锁**：RR / SERIALIZABLE 下的加锁读、`UPDATE`、`DELETE` 现在会登记间隙锁（next-key），插入通过"插入意向"等待。
+  `scripts/txn_check.py` 里 31 个间隙锁场景（范围、等值命中/未命中、二级索引、全表扫描、反向扫描、`LIMIT`、边界是否恰好存在、
+  经典死锁、READ COMMITTED 不加锁、SERIALIZABLE 普通读……）与 MySQL 8.0.40 的 InnoDB **逐行一致**；
+  规则都是用 InnoDB 实测得到的（见 `docs/plan-gap-latch.md` 变更记录 v3）。
+- **物理并发**：不再有保护所有 B+ 树的全局读写锁。每棵树两级锁（SMO 锁 + 叶子锁），版本链受所在主索引叶子的锁保护，
+  行锁表分片，唯一键条纹锁，purge 先 `tryLock` 行 X 锁。写和读不再互相阻塞（引擎核心基准：90% 读 + 10% 写的混合负载 4 核下快 2.2 倍，
+  扩展倍数从 1.0 提高到 3.0）。
+
 ## 遗留限制（有意不做，或尚未做）
-1. **没有间隙锁/next-key 锁**。已用实验确认：A 在事务里对 `id >= 2` 做 `SELECT … FOR UPDATE`，B 往该范围插入——
-   InnoDB 会阻塞 B，MyEngine 不会，A 再次 `FOR UPDATE` 会读到新行（幻读）。快照读（普通 SELECT）不受影响。
-   同理 SERIALIZABLE 只有行级 S 锁，不防幻读。
+1. **二级索引扫描的停止条目**：InnoDB 还会锁它的记录部分（实测：`WHERE k BETWEEN 2 AND 3 FOR UPDATE` 之后，
+   `UPDATE ... SET k=9 WHERE id=<停止条目的行>` 被 InnoDB 阻塞，本引擎不阻塞）。我们只锁间隙。这只是少锁一点（并发略高）：
+   范围内的幻读仍被间隙锁完全防住，停止条目移入范围会撞上间隙锁。
 2. **没有持久化**：事务只有 ACI，没有 D。mysqld 重启后表结构还在、数据为空。
 3. **不参与 XA/两阶段提交**：与其他引擎（如 InnoDB）混用事务时，跨引擎的提交不是原子的。
 4. **死锁牺牲者的选择规则与 InnoDB 不同**：本引擎总是让"形成环的那个请求者"当牺牲者；InnoDB 按事务权重选择。结果都是恰好一个 1213。
-5. **B+ 树的物理并发仍是一把全局读写锁**：逻辑上不同行的写不会互相等待行锁，但每次树操作仍在全局锁内串行，写吞吐受限于此。
-6. 不支持 `START TRANSACTION WITH CONSISTENT SNAPSHOT`、外键、在线 DDL；`READ UNCOMMITTED` 按 `READ COMMITTED` 处理。
-7. 加锁读会给扫描过的每一行加锁且不提前释放（InnoDB 在 READ COMMITTED 下会释放不匹配行的锁）。
-8. 锁等待超时是引擎自己的配置（环境变量 `MYENGINE_LOCK_WAIT_SECS`，默认 50 秒），读不到 `innodb_lock_wait_timeout`。
+5. **SMO 仍是整棵树独占**：节点分裂/合并时整棵树短暂停顿（`maxKeys=32` 时约每 16 次插入一次）。更细的 SMO 并发（B-link 树）没有做。
+6. **一致性读的单核开销比改造前高**：细粒度加锁的固有代价（见 `docs/bench-baseline.md` 第五轮）。进一步的办法是读路径完全无锁
+   （写时复制的叶子 + 原子指针），没有做。
+7. 不支持 `START TRANSACTION WITH CONSISTENT SNAPSHOT`、外键、在线 DDL；`READ UNCOMMITTED` 按 `READ COMMITTED` 处理。
+8. 加锁读会给扫描过的每一行加锁且不提前释放（InnoDB 在 READ COMMITTED 下会释放不匹配行的锁）。
+9. 锁等待超时是引擎自己的配置（环境变量 `MYENGINE_LOCK_WAIT_SECS`，默认 50 秒），读不到 `innodb_lock_wait_timeout`。
