@@ -532,6 +532,15 @@ def rc_unlocks_nonmatching_rows(c):
     c.run("R", "ROLLBACK")
 
 
+@scenario
+def unique_dup_error_keeps_shared_lock(c):
+    # 唯一键重复错误后，冲突行上留 S 锁：别人删不掉它（被挡），本事务重试同一个 INSERT 仍然报重复
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gu VALUES (11, 1)")                 # gu.e 唯一，(10,1) 已存在 -> 重复
+    c.run("B", "DELETE FROM gu WHERE id=10")                                          # 被 A 的 S 锁挡住（收尾解除）
+    c.run("A", "INSERT INTO gu VALUES (12, 1)")                                       # 重试：仍是重复
+    c.run("A", "ROLLBACK")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--socket", required=True)
     ap.add_argument("--only"); ap.add_argument("--timeout-tests", action="store_true"); ap.add_argument("-v", action="store_true")

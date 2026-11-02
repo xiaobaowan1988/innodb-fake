@@ -50,7 +50,10 @@ var (
 const killPoll = 100 * time.Millisecond
 
 // DupError 表示唯一键冲突；Idx 是冲突的索引号（0 为主键）。
-type DupError struct{ Idx int }
+type DupError struct {
+	Idx int
+	Pk  []byte // 唯一二级索引冲突时，冲突行的主键（用来在其上保留 S 锁）
+}
 
 func (e DupError) Error() string { return "myengine: duplicate key" }
 
@@ -837,7 +840,7 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 				}
 				for _, s := range v.sec {
 					if s.idx == sk.idx && bytes.Equal(s.key, sk.key) {
-						err = DupError{sk.idx}
+						err = DupError{Idx: sk.idx, Pk: append([]byte(nil), cpk...)}
 						return
 					}
 				}
@@ -849,6 +852,22 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 		}
 	}
 	return nil, nil
+}
+
+// holdDup：唯一二级索引冲突时，InnoDB 在冲突行上保留 S 锁到事务结束（重复错误因此可重复）。
+// 返回 true 表示刚取得了 S 锁、需要重新检查；false 表示此前已持有，可以直接报错。
+func (e *Engine) holdDup(t *Txn, tb *table, err error) (bool, error) {
+	d, ok := err.(DupError)
+	if !ok || d.Pk == nil {
+		return false, nil
+	}
+	if _, held := t.held[lockKey{tb, string(d.Pk)}]; held {
+		return false, nil
+	}
+	if lerr := e.lm.lock(t, tb, d.Pk, lockS); lerr != nil {
+		return false, lerr
+	}
+	return true, nil
 }
 
 // putSecEntries 为新版本发布它的二级索引条目。
@@ -875,7 +894,7 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 			return err
 		}
 		if liveNow() {
-			return DupError{0}
+			return DupError{}
 		}
 	}
 	if err := e.lm.lock(t, tb, pk, lockX); err != nil {
@@ -895,11 +914,16 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 			if !had {
 				e.lm.downgrade(t, tb, pk)
 			}
-			return DupError{0}
+			return DupError{}
 		}
 		wait, err := e.checkUnique(t, tb, [][]byte{pk}, sec)
 		if err != nil {
 			unlockU()
+			if again, lerr := e.holdDup(t, tb, err); lerr != nil {
+				return lerr
+			} else if again {
+				continue
+			}
 			// 唯一键冲突导致插入失败，而这个主键上并没有活的行：InnoDB 里回滚掉的插入不留锁，
 			// 这里也把本次新取的 X 锁放掉，否则别的事务会无谓地等在一个不存在的行上。
 			if !had {
@@ -944,7 +968,7 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 		if dup {
 			unlockIdx()
 			unlockU()
-			return DupError{0}
+			return DupError{}
 		}
 		putSecEntries(tb, pk, v)
 		unlockIdx()
@@ -982,12 +1006,17 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 			})
 			if newLive {
 				unlockU()
-				return DupError{0}
+				return DupError{}
 			}
 		}
 		wait, err := e.checkUnique(t, tb, [][]byte{oldpk, newpk}, sec)
 		if err != nil {
 			unlockU()
+			if again, lerr := e.holdDup(t, tb, err); lerr != nil {
+				return lerr
+			} else if again {
+				continue
+			}
 			return err
 		}
 		if wait != nil {

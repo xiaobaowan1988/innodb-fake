@@ -878,7 +878,7 @@ func TestUnlockLastOnlyUnderReadCommitted(t *testing.T) {
 		if _, err := c.Seek(nil, seekFirst); err != nil {
 			t.Fatal(err)
 		}
-		c.UnlockLast() // 第 1 行"不匹配"
+		c.UnlockLast()                       // 第 1 行"不匹配"
 		if _, err := c.Step(1); err != nil { // 第 2 行"匹配"，保持锁
 			t.Fatal(err)
 		}
@@ -903,5 +903,35 @@ func TestUnlockLastOnlyUnderReadCommitted(t *testing.T) {
 		}
 		e.Rollback(a)
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// 唯一二级索引重复错误之后，冲突的已提交行上保留 S 锁：别人删不掉它，重复错误因此可重复；两个同样重复的插入互不阻塞。
+func TestUniqueDupHoldsSharedLockOnConflictRow(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	if err := e.Insert(s, tb, pk4(1), row8(7), secs(7, true)); err != nil {
+		t.Fatal(err)
+	}
+	e.Commit(s)
+	a, b, c := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	var d DupError
+	if err := e.Insert(a, tb, pk4(2), row8(7), secs(7, true)); !errors.As(err, &d) || d.Idx != 2 {
+		t.Fatalf("want dup on idx 2, got %v", err)
+	}
+	if err := e.Insert(c, tb, pk4(3), row8(7), secs(7, true)); !errors.As(err, &d) { // S 与 S 兼容
+		t.Fatalf("second dup must not block, got %v", err)
+	}
+	res := make(chan error, 1)
+	go func() { res <- e.Delete(b, tb, pk4(1)) }()
+	select {
+	case err := <-res:
+		t.Fatalf("delete of the conflicting row must wait for a's S lock, got %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	e.Commit(a)
+	e.Commit(c)
+	if err := <-res; err != nil {
+		t.Fatal(err)
 	}
 }
