@@ -620,3 +620,189 @@ func TestKilledWaitsReturnPromptly(t *testing.T) {
 	}
 	e.Rollback(holder)
 }
+
+// ---------------------------------------------------------------- 行锁队列公平性、NOWAIT / SKIP LOCKED
+
+func lockAsync(e *Engine, tx *Txn, tb *table, id, mode int) chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- e.lm.lock(tx, tb, pk4(id), mode) }()
+	return ch
+}
+
+func waitDone(ch chan error, d time.Duration) (error, bool) {
+	select {
+	case err := <-ch:
+		return err, true
+	case <-time.After(d):
+		return nil, false
+	}
+}
+
+// A 持有 S，B 请求 X（等待），C 再请求 S：C 必须排在 B 后面，不能插队。
+func TestLockQueueIsFifo(t *testing.T) {
+	e, tb := newTestEngine(t)
+	a, b, c := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	for _, x := range []*Txn{a, b, c} {
+		x.timeout = 5 * time.Second
+	}
+	if err := e.lm.lock(a, tb, pk4(1), lockS); err != nil {
+		t.Fatal(err)
+	}
+	chB := lockAsync(e, b, tb, 1, lockX)
+	if _, done := waitDone(chB, 150*time.Millisecond); done {
+		t.Fatal("B (X) must wait for A's S lock")
+	}
+	chC := lockAsync(e, c, tb, 1, lockS)
+	if _, done := waitDone(chC, 200*time.Millisecond); done {
+		t.Fatal("C (S) jumped the queue ahead of the waiting writer B")
+	}
+	e.Commit(a)
+	if err, done := waitDone(chB, 2*time.Second); !done || err != nil {
+		t.Fatalf("B should get X after A commits: %v %v", err, done)
+	}
+	if _, done := waitDone(chC, 150*time.Millisecond); done {
+		t.Fatal("C must still wait while B holds X")
+	}
+	e.Commit(b)
+	if err, done := waitDone(chC, 2*time.Second); !done || err != nil {
+		t.Fatalf("C should get S after B commits: %v %v", err, done)
+	}
+	e.Commit(c)
+}
+
+// 持续有读者轮流持有 S 锁（任何时刻至少一个读者持有），写者必须在有限时间内拿到 X——没有队列的话会被无限期饿死。
+func TestWriterIsNotStarvedByOverlappingReaders(t *testing.T) {
+	e, tb := newTestEngine(t)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			time.Sleep(time.Duration(r) * 3 * time.Millisecond) // 错开：保证任意时刻都有读者持有锁
+			for !stop.Load() {
+				tx := e.Begin(isoRepeatableRead)
+				if e.lm.lock(tx, tb, pk4(1), lockS) == nil {
+					time.Sleep(12 * time.Millisecond)
+				}
+				e.Commit(tx)
+			}
+		}(r)
+	}
+	time.Sleep(50 * time.Millisecond)
+	w := e.Begin(isoRepeatableRead)
+	w.timeout = 3 * time.Second
+	t0 := time.Now()
+	err := e.lm.lock(w, tb, pk4(1), lockX)
+	took := time.Since(t0)
+	stop.Store(true)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("writer starved by overlapping readers: %v after %v", err, took)
+	}
+	if took > time.Second {
+		t.Fatalf("writer waited too long: %v", took)
+	}
+}
+
+// 锁升级不排队：A 持有 S，B 等 X，A 升级成 X 必须立即成功（只被其它持有者阻塞），不能被人为地造成死锁。
+func TestUpgradeDoesNotQueueBehindWaiters(t *testing.T) {
+	e, tb := newTestEngine(t)
+	a, b := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	a.timeout, b.timeout = 3*time.Second, 3*time.Second
+	e.lm.lock(a, tb, pk4(1), lockS)
+	chB := lockAsync(e, b, tb, 1, lockX)
+	if _, done := waitDone(chB, 150*time.Millisecond); done {
+		t.Fatal("B must wait")
+	}
+	up := make(chan error, 1)
+	go func() { up <- e.lm.lock(a, tb, pk4(1), lockX) }()
+	if err, done := waitDone(up, time.Second); !done || err != nil {
+		t.Fatalf("upgrade should succeed immediately, got %v (done=%v)", err, done)
+	}
+	e.Commit(a)
+	if err, done := waitDone(chB, 2*time.Second); !done || err != nil {
+		t.Fatalf("B should proceed after A: %v %v", err, done)
+	}
+}
+
+// 排在队列前面的等待者放弃（超时/被 KILL）之后，后面的等待者必须被唤醒并前进，而不是一直睡下去。
+func TestAbandoningWaiterWakesTheOnesBehindIt(t *testing.T) {
+	e, tb := newTestEngine(t)
+	a, b, c := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	a.timeout, c.timeout = 5*time.Second, 5*time.Second
+	b.timeout = 300 * time.Millisecond // B 很快超时
+	e.lm.lock(a, tb, pk4(1), lockS)
+	chB := lockAsync(e, b, tb, 1, lockX) // 排第一，被 A 的 S 阻塞，300ms 后超时
+	time.Sleep(100 * time.Millisecond)
+	chC := lockAsync(e, c, tb, 1, lockS) // 排在 B 后面，只因为 B 在前面才等
+	if _, done := waitDone(chC, 100*time.Millisecond); done {
+		t.Fatal("C should wait behind B")
+	}
+	if err, done := waitDone(chB, 2*time.Second); !done || !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("B should time out: %v %v", err, done)
+	}
+	if err, done := waitDone(chC, time.Second); !done || err != nil {
+		t.Fatalf("C must be woken when B gives up (A only holds S, which is compatible): %v %v", err, done)
+	}
+}
+
+func TestNoWaitAndSkipLocked(t *testing.T) {
+	e, tb := gapFixture(t)
+	holder := newTx(e, isoReadCommitted) // RC：不登记间隙锁，只看行锁
+	if _, err := e.GetRow(holder, tb, pk4(20), lockX); err != nil {
+		t.Fatal(err)
+	}
+	// NOWAIT：遇到被锁的行立即失败
+	a := newTx(e, isoReadCommitted)
+	c := e.OpenCursor(a, tb, 0, lockX, 4)
+	c.SetWaitPolicy(waitNoWait)
+	t0 := time.Now()
+	_, err := c.Seek(pk4(10), seekGE)
+	for err == nil {
+		_, err = c.Step(1)
+	}
+	if !errors.Is(err, ErrNoWait) || time.Since(t0) > time.Second {
+		t.Fatalf("NOWAIT should fail immediately with ErrNoWait, got %v after %v", err, time.Since(t0))
+	}
+	e.Rollback(a) // a 在碰到被锁的行之前已经锁住了 id=10，必须释放，否则会干扰下面的 SKIP LOCKED 断言
+	// SKIP LOCKED：跳过被锁的行，返回其余的行
+	b := newTx(e, isoReadCommitted)
+	cs := e.OpenCursor(b, tb, 0, lockX, 4)
+	cs.SetWaitPolicy(waitSkip)
+	var ids []int
+	r, err := cs.Seek(nil, seekFirst)
+	for err == nil {
+		ids = append(ids, rowVal(r)*10)
+		r, err = cs.Step(1)
+	}
+	if !errors.Is(err, ErrNotFound) || len(ids) != 4 || ids[0] != 10 || ids[1] != 30 {
+		t.Fatalf("SKIP LOCKED should skip id=20 only: %v err=%v", ids, err)
+	}
+	e.Rollback(b) // b 的 SKIP LOCKED 扫描已经锁住了其余的行，释放掉，下面单独验证按主键取行
+	// 按主键取一行（rnd_pos）：NOWAIT 报错，SKIP LOCKED 当作"没有这一行"
+	if _, err := e.GetRowPolicy(newTx(e, isoReadCommitted), tb, pk4(20), lockX, waitNoWait); !errors.Is(err, ErrNoWait) {
+		t.Fatalf("GetRow NOWAIT: %v", err)
+	}
+	if _, err := e.GetRowPolicy(newTx(e, isoReadCommitted), tb, pk4(20), lockX, waitSkip); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRow SKIP LOCKED: %v", err)
+	}
+	// 没被锁的行不受策略影响
+	if r, err := e.GetRowPolicy(newTx(e, isoReadCommitted), tb, pk4(30), lockX, waitNoWait); err != nil || rowVal(r) != 3 {
+		t.Fatalf("unlocked row with NOWAIT: %v %v", r, err)
+	}
+}
+
+// 一致性快照在建立的那一刻固定下来，之后别人的提交看不到。
+func TestSnapshotIsTakenImmediately(t *testing.T) {
+	e, tb := gapFixture(t)
+	a := e.Begin(isoRepeatableRead)
+	a.Snapshot()
+	w := e.Begin(isoRepeatableRead)
+	e.Update(w, tb, pk4(10), pk4(10), row8(99), secs(99, false))
+	e.Commit(w)
+	a.StmtBegin(isoRepeatableRead)
+	if v, _ := get(e, a, tb, 10); v != 1 {
+		t.Fatalf("snapshot must predate the later commit, saw %d", v)
+	}
+}

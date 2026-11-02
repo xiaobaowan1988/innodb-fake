@@ -27,6 +27,7 @@ class ha_myengine : public handler {
   unsigned long long txn_h = 0;   // 当前语句所属事务句柄
   unsigned long long cur = 0;     // 当前游标句柄，0 表示无
   int row_lock = 0;               // 本语句对该表的行锁模式：0 一致性读，1 S，2 X
+  int wait_policy = 0;            // 加锁读的等待策略：0 等待，1 NOWAIT，2 SKIP LOCKED
   enum thr_lock_type stmt_lock_type = TL_UNLOCK;  // store_lock 收到的原始锁类型
   bool scan_started = false;
   std::vector<uchar> key_scratch;  // index_read_map 还原查找键用的私有缓冲区

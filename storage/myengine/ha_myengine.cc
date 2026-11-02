@@ -10,6 +10,10 @@
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "mysqld_error.h"
+#include "sql/key_spec.h"
+#include "sql/sql_alter.h"
+#include "sql/sql_class.h"
+#include "sql/sql_lex.h"
 #include "sql/field.h"
 #include "sql/key.h"
 #include "sql/query_options.h"
@@ -22,7 +26,7 @@ static const bool g_trace = getenv("MYENGINE_TRACE") != nullptr;
   do { if (g_trace) fprintf(stderr, "[myengine] %s " fmt "\n", __func__, ##__VA_ARGS__); } while (0)
 
 // Go 端返回码
-enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_DEADLOCK = 5, RC_TIMEOUT = 6, RC_KILLED = 7 };
+enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_DEADLOCK = 5, RC_TIMEOUT = 6, RC_KILLED = 7, RC_NOWAIT = 8 };
 // 行锁模式
 enum { LOCK_NONE = 0, LOCK_S = 1, LOCK_X = 2 };
 // Go 端 seek 模式
@@ -97,6 +101,20 @@ static int myengine_savepoint_rollback(handlerton *, THD *thd, void *sv) {
 }
 static int myengine_savepoint_release(handlerton *, THD *, void *) { return 0; }
 
+// START TRANSACTION WITH CONSISTENT SNAPSHOT：RR 下立即开始事务并建立视图。
+static int myengine_start_consistent_snapshot(handlerton *, THD *thd) {
+  int iso = thd_tx_isolation(thd);
+  unsigned long long h = trx_of(thd);
+  if (!h) {
+    h = MyEngine_TxnBegin(iso);
+    MyEngine_TxnSetKill(h, (void *)myengine_killed, thd);
+    set_trx(thd, h);
+  }
+  trans_register_ha(thd, true, myengine_hton, nullptr);  // 让 COMMIT/ROLLBACK 时我们的钩子被调用
+  if (iso == ISO_REPEATABLE_READ || iso == ISO_SERIALIZABLE) MyEngine_TxnSnapshot(h);
+  return 0;
+}
+
 static handler *myengine_create_handler(handlerton *hton, TABLE_SHARE *table, bool, MEM_ROOT *mem_root) {
   return new (mem_root) ha_myengine(hton, table);
 }
@@ -110,6 +128,7 @@ static int myengine_init(void *p) {
   hton->commit = myengine_commit;
   hton->rollback = myengine_rollback;
   hton->close_connection = myengine_close_connection;
+  hton->start_consistent_snapshot = myengine_start_consistent_snapshot;
   hton->savepoint_offset = sizeof(unsigned long long);
   hton->savepoint_set = myengine_savepoint_set;
   hton->savepoint_rollback = myengine_savepoint_rollback;
@@ -204,6 +223,18 @@ void ha_myengine::pack_sec(const uchar *rec, std::string &out) const {
 
 int ha_myengine::create(const char *name, TABLE *form, HA_CREATE_INFO *, dd::Table *) {
   TRACE("name=%s", name);
+  // 引擎不支持外键：绝不能像 MyISAM 那样静默忽略（那样孤儿行会悄悄写进去，InnoDB 会报 1452）。
+  // 对没有 HTON_SUPPORTS_FOREIGN_KEYS 的引擎，服务器在调用 create() 之前就把外键从表定义里丢掉了，
+  // 引擎唯一能看到外键子句的地方是当前语句的 alter_info->key_list。
+  THD *cur_thd = current_thd;
+  if (cur_thd != nullptr && cur_thd->lex != nullptr && cur_thd->lex->alter_info != nullptr) {
+    for (const Key_spec *k : cur_thd->lex->alter_info->key_list) {
+      if (k->type == KEYTYPE_FOREIGN) {
+        my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0), "MyEngine", "FOREIGN KEY");
+        return HA_WRONG_CREATE_OPTION;
+      }
+    }
+  }
   if (form->s->primary_key == MAX_KEY) {
     my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0), "MyEngine", "table without PRIMARY KEY");
     return HA_WRONG_CREATE_OPTION;
@@ -268,6 +299,9 @@ int ha_myengine::map_rc(int rc, int not_found_code) {
       thd_mark_transaction_to_rollback(ha_thd(), 1);  // 与 InnoDB 一致：死锁时整个事务回滚
       return HA_ERR_LOCK_DEADLOCK;
     case RC_TIMEOUT: return HA_ERR_LOCK_WAIT_TIMEOUT;
+    case RC_NOWAIT:  // NOWAIT：与 InnoDB 一致，报 ER_LOCK_NOWAIT(3572)
+      my_error(ER_LOCK_NOWAIT, MYF(0));
+      return HA_ERR_NO_WAIT_LOCK;
     case RC_KILLED:  // 与 InnoDB 一致：设置 kill 状态（客户端收到 1317），返回通用错误
       thd_set_kill_status(ha_thd());
       return HA_ERR_GENERIC;
@@ -362,7 +396,7 @@ void ha_myengine::close_cursor() {
 
 void ha_myengine::open_cursor(uint idx) {
   close_cursor();
-  cur = MyEngine_CursorOpen(txn_h, tbl_h, idx, row_lock, pk_width);
+  cur = MyEngine_CursorOpen(txn_h, tbl_h, idx, row_lock, pk_width, wait_policy);
 }
 
 // 每行只跨一次语言边界：Go 端完成 移动游标 + 可见性判断/加锁 + (二级索引)回表 + 拷出整行。
@@ -465,7 +499,7 @@ void ha_myengine::position(const uchar *record) {
 
 int ha_myengine::rnd_pos(uchar *buf, uchar *pos) {
   size_t len = 0;
-  int rc = MyEngine_GetRow(txn_h, tbl_h, pos, pk_width, row_lock, buf, table->s->reclength, &len);
+  int rc = MyEngine_GetRow(txn_h, tbl_h, pos, pk_width, row_lock, wait_policy, buf, table->s->reclength, &len);
   return map_rc(rc, HA_ERR_KEY_NOT_FOUND);
 }
 
@@ -587,7 +621,15 @@ int ha_myengine::external_lock(THD *thd, int lock_type) {
 int ha_myengine::start_stmt(THD *thd, thr_lock_type) { return begin_stmt(thd); }
 
 THR_LOCK_DATA **ha_myengine::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type) {
-  if (lock_type != TL_IGNORE) stmt_lock_type = lock_type;  // 记住原始锁类型，用于决定行锁模式
+  if (lock_type != TL_IGNORE) {
+    stmt_lock_type = lock_type;  // 记住原始锁类型，用于决定行锁模式
+    // SELECT ... FOR UPDATE NOWAIT / SKIP LOCKED：策略由 TABLE_LIST 的 lock_descriptor 给出
+    switch (table->pos_in_table_list->lock_descriptor().action) {
+      case THR_NOWAIT: wait_policy = 1; break;
+      case THR_SKIP: wait_policy = 2; break;
+      default: wait_policy = 0; break;
+    }
+  }
   if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK) {
     // 行级并发由引擎自己的行锁负责：把表级写锁降级，避免不同连接在表级互相阻塞（InnoDB 的做法）
     if (lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE && !thd_in_lock_tables(thd))

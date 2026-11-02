@@ -267,6 +267,10 @@ func (t *Txn) StmtBegin(iso int) {
 	}
 }
 
+// Snapshot 立即建立一致性读的视图（START TRANSACTION WITH CONSISTENT SNAPSHOT）。
+// 只对 RR/SERIALIZABLE 有意义；其它隔离级别下每条语句本来就会重新取视图。
+func (t *Txn) Snapshot() { t.readView() }
+
 // StmtEnd 标记一条顶层语句结束；下一次 StmtBegin 才会开始新语句。
 func (t *Txn) StmtEnd() { t.inStmt = false }
 
@@ -448,15 +452,18 @@ type lockKey struct {
 	pk  string
 }
 
+// waiter 是行锁等待队列里的一项。位置在被唤醒后保持不变（唤醒后重新判断，不是重新排到队尾），
+// 所以排在前面的冲突请求一定先被满足——否则持续到来的读锁可以让一个写者无限期等待。
 type waiter struct {
-	ch  chan struct{}
-	txn *Txn
+	txn  *Txn
+	mode int
+	ch   chan struct{} // 被唤醒时关闭并换成新的（都在分片锁内进行）
 }
 
 type rowLock struct {
 	x       *Txn
 	s       map[*Txn]struct{}
-	waiters []*waiter
+	waiters []*waiter // 按到达顺序排队
 }
 
 const lmShards = 64
@@ -472,6 +479,18 @@ type lockMgr struct {
 	shards [lmShards]lockShard
 	dmu    sync.Mutex
 }
+
+// 行锁等待策略（对应 MySQL 的 NOWAIT / SKIP LOCKED，只对加锁读生效）
+const (
+	waitNormal = 0
+	waitNoWait = 1
+	waitSkip   = 2
+)
+
+var (
+	ErrNoWait  = errors.New("myengine: lock not available (NOWAIT)")
+	errSkipRow = errors.New("myengine: row skipped (SKIP LOCKED)") // 仅在引擎内部使用
+)
 
 func (lm *lockMgr) shard(key lockKey) *lockShard {
 	h := uint32(2166136261)
@@ -490,15 +509,45 @@ func (sh *lockShard) cleanup(key lockKey, rl *rowLock) {
 	}
 }
 
+// wakeAll 唤醒这把锁上的所有等待者让它们重新判断（保持队列位置）。调用者持有分片锁。
+func (lm *lockMgr) wakeAll(rl *rowLock) {
+	if len(rl.waiters) == 0 {
+		return
+	}
+	lm.dmu.Lock()
+	for _, w := range rl.waiters {
+		w.txn.blockedOn = nil // 被唤醒者的等待边已过期，清掉，避免后续死锁检测误判
+		close(w.ch)
+		w.ch = make(chan struct{})
+	}
+	lm.dmu.Unlock()
+}
+
+func (rl *rowLock) removeWaiter(w *waiter) {
+	for i, x := range rl.waiters {
+		if x == w {
+			rl.waiters = append(rl.waiters[:i], rl.waiters[i+1:]...)
+			return
+		}
+	}
+}
+
 // lock 取行锁，必要时阻塞。调用者不得持有任何树锁、gapMu、条纹锁。
 func (e *Engine) lock(t *Txn, tb *table, pk []byte, mode int) error {
-	return e.lm.lock(t, tb, pk, mode)
+	return e.lm.lockPolicy(t, tb, pk, mode, waitNormal)
 }
 
 func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
+	return lm.lockPolicy(t, tb, pk, mode, waitNormal)
+}
+
+// lockPolicy 按到达顺序排队取锁：新请求除了被冲突的持有者阻塞，还被排在它前面的、与它冲突的等待者阻塞。
+// 例外：锁升级（已持有 S 再请求 X）不排队，只被其它持有者阻塞——否则"A 持 S，B 等 X，A 升级 X"会被人为地造成死锁。
+func (lm *lockMgr) lockPolicy(t *Txn, tb *table, pk []byte, mode, policy int) error {
 	key := lockKey{tb, string(pk)}
 	sh := lm.shard(key)
 	var deadline time.Time
+	var w *waiter // 一旦入队就保持，直到授予或放弃
 	waited := false
 	for {
 		sh.mu.Lock()
@@ -507,18 +556,17 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 			rl = &rowLock{s: map[*Txn]struct{}{}}
 			sh.locks[key] = rl
 		}
-		if rl.x == t {
+		_, holdsS := rl.s[t]
+		if rl.x == t || (mode == lockS && holdsS) { // 已经持有足够强的锁
+			if w != nil {
+				rl.removeWaiter(w)
+				lm.wakeAll(rl)
+			}
 			sh.mu.Unlock()
 			lm.clearWait(t, waited)
 			return nil
 		}
-		if mode == lockS {
-			if _, ok := rl.s[t]; ok {
-				sh.mu.Unlock()
-				lm.clearWait(t, waited)
-				return nil
-			}
-		}
+		upgrade := mode == lockX && holdsS
 		var blockers []*Txn
 		if rl.x != nil {
 			blockers = append(blockers, rl.x)
@@ -530,6 +578,16 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 				}
 			}
 		}
+		if !upgrade { // 排在前面的、与我冲突的等待者也要等
+			for _, e := range rl.waiters {
+				if e == w {
+					break
+				}
+				if e.txn != t && (e.mode == lockX || mode == lockX) {
+					blockers = append(blockers, e.txn)
+				}
+			}
+		}
 		if len(blockers) == 0 { // 授予
 			if mode == lockX {
 				rl.x = t
@@ -538,9 +596,25 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 				rl.s[t] = struct{}{}
 			}
 			t.held[key] = struct{}{}
+			if w != nil {
+				rl.removeWaiter(w)
+			}
 			sh.mu.Unlock()
 			lm.clearWait(t, waited)
 			return nil
+		}
+		if policy != waitNormal { // NOWAIT / SKIP LOCKED：需要等待就立即放弃
+			if w != nil {
+				rl.removeWaiter(w)
+				lm.wakeAll(rl)
+			}
+			sh.cleanup(key, rl)
+			sh.mu.Unlock()
+			lm.clearWait(t, waited)
+			if policy == waitNoWait {
+				return ErrNoWait
+			}
+			return errSkipRow
 		}
 		lm.dmu.Lock()
 		t.blockedOn = blockers
@@ -550,19 +624,26 @@ func (lm *lockMgr) lock(t *Txn, tb *table, pk []byte, mode int) error {
 		}
 		lm.dmu.Unlock()
 		if cyc {
+			if w != nil {
+				rl.removeWaiter(w)
+				lm.wakeAll(rl) // 排在我后面的等待者可能因为我的离开而可以前进
+			}
 			sh.cleanup(key, rl)
 			sh.mu.Unlock()
 			return ErrDeadlock
 		}
-		w := &waiter{ch: make(chan struct{}), txn: t}
-		rl.waiters = append(rl.waiters, w)
+		if w == nil {
+			w = &waiter{txn: t, mode: mode, ch: make(chan struct{})}
+			rl.waiters = append(rl.waiters, w)
+		}
+		ch := w.ch
 		sh.mu.Unlock()
 		waited = true
 
 		if deadline.IsZero() {
 			deadline = time.Now().Add(t.timeout)
 		}
-		if err := t.waitOn(w.ch, deadline); err != nil {
+		if err := t.waitOn(ch, deadline); err != nil {
 			lm.abandon(t, key, w)
 			return err
 		}
@@ -577,7 +658,7 @@ func (lm *lockMgr) clearWait(t *Txn, waited bool) {
 	}
 }
 
-// tryLock 不阻塞地尝试取行锁，取不到返回 false（purge 用）。
+// tryLock 不阻塞地尝试取行锁，取不到返回 false（purge 用）。有人在排队时也让路，不去插队。
 func (lm *lockMgr) tryLock(t *Txn, tb *table, pk []byte, mode int) bool {
 	key := lockKey{tb, string(pk)}
 	sh := lm.shard(key)
@@ -588,7 +669,7 @@ func (lm *lockMgr) tryLock(t *Txn, tb *table, pk []byte, mode int) bool {
 		rl = &rowLock{s: map[*Txn]struct{}{}}
 		sh.locks[key] = rl
 	}
-	if rl.x != nil && rl.x != t || mode == lockX && len(rl.s) > 0 {
+	if rl.x != nil && rl.x != t || mode == lockX && len(rl.s) > 0 || len(rl.waiters) > 0 {
 		sh.cleanup(key, rl)
 		return false
 	}
@@ -601,17 +682,13 @@ func (lm *lockMgr) tryLock(t *Txn, tb *table, pk []byte, mode int) bool {
 	return true
 }
 
-// abandon：等待超时，退出等待队列。
+// abandon：等待超时/被 KILL，退出等待队列，并唤醒排在后面的等待者（它们可能因为我的离开而可以前进）。
 func (lm *lockMgr) abandon(t *Txn, key lockKey, w *waiter) {
 	sh := lm.shard(key)
 	sh.mu.Lock()
 	if rl := sh.locks[key]; rl != nil {
-		for i, x := range rl.waiters {
-			if x == w {
-				rl.waiters = append(rl.waiters[:i], rl.waiters[i+1:]...)
-				break
-			}
-		}
+		rl.removeWaiter(w)
+		lm.wakeAll(rl)
 		sh.cleanup(key, rl)
 	}
 	sh.mu.Unlock()
@@ -620,7 +697,7 @@ func (lm *lockMgr) abandon(t *Txn, key lockKey, w *waiter) {
 	lm.dmu.Unlock()
 }
 
-// deadlock 沿"等待 -> 持有者"的边做 DFS，若能回到 t 就是死锁。调用者持有 lm.dmu。
+// deadlock 沿"等待 -> 阻塞者"的边做 DFS，若能回到 t 就是死锁。调用者持有 lm.dmu。
 func (lm *lockMgr) deadlock(t *Txn) bool {
 	seen := map[*Txn]bool{}
 	var dfs func(x *Txn) bool
@@ -650,15 +727,7 @@ func (lm *lockMgr) releaseAll(t *Txn) {
 				rl.x = nil
 			}
 			delete(rl.s, t)
-			if len(rl.waiters) > 0 {
-				lm.dmu.Lock()
-				for _, w := range rl.waiters {
-					w.txn.blockedOn = nil // 被唤醒者的等待边已过期，清掉，避免后续死锁检测误判
-					close(w.ch)
-				}
-				lm.dmu.Unlock()
-				rl.waiters = nil
-			}
+			lm.wakeAll(rl)
 			sh.cleanup(key, rl)
 		}
 		sh.mu.Unlock()
@@ -928,6 +997,11 @@ func (e *Engine) Delete(t *Txn, tb *table, pk []byte) error {
 
 // GetRow 按主键读一行。lock == lockNone 为一致性读（快照），否则先加锁再读最新版本（当前读）。
 func (e *Engine) GetRow(t *Txn, tb *table, pk []byte, lock int) ([]byte, error) {
+	return e.GetRowPolicy(t, tb, pk, lock, waitNormal)
+}
+
+// GetRowPolicy 同 GetRow，加锁读时可以指定等待策略；SKIP LOCKED 下被锁住的行按"没有这一行"处理。
+func (e *Engine) GetRowPolicy(t *Txn, tb *table, pk []byte, lock, policy int) ([]byte, error) {
 	var data []byte
 	ok := false
 	if lock == lockNone {
@@ -941,7 +1015,10 @@ func (e *Engine) GetRow(t *Txn, tb *table, pk []byte, lock int) ([]byte, error) 
 			}
 		})
 	} else {
-		if err := e.lm.lock(t, tb, pk, lock); err != nil {
+		if err := e.lm.lockPolicy(t, tb, pk, lock, policy); err != nil {
+			if errors.Is(err, errSkipRow) {
+				return nil, ErrNotFound
+			}
 			return nil, err
 		}
 		tb.withHead(pk, func(h *rowHead) {
@@ -963,6 +1040,7 @@ type Cursor struct {
 	tbl     *table
 	idx     int
 	lock    int
+	policy  int // 行锁等待策略：waitNormal / waitNoWait / waitSkip（只对加锁读生效）
 	pkWidth int // 主键编码宽度；二级索引条目末尾的 pkWidth 字节就是主键
 	raw     rawCursor
 	ix      *idxState
@@ -993,6 +1071,9 @@ type batchEnt struct {
 	key []byte
 	row []byte // nil 表示对当前视图没有可见的、未删除的版本（真实的行数据永远非空）
 }
+
+// SetWaitPolicy 设置加锁读的等待策略（SELECT ... FOR UPDATE NOWAIT / SKIP LOCKED）。
+func (c *Cursor) SetWaitPolicy(p int) { c.policy = p }
 
 func (e *Engine) OpenCursor(t *Txn, tb *table, idx, lock, pkWidth int) *Cursor {
 	c := &Cursor{e: e, t: t, tbl: tb, idx: idx, lock: lock, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}, ix: tb.ix[idx], batchN: 2}
@@ -1196,7 +1277,11 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		pk := c.pk()
 		deadKey := c.raw.key
 		// 加锁读：此刻没有持有任何树锁/gapMu，可以安全地等行锁；醒来后树可能变了，游标会按 key 重新定位
-		if err := e.lm.lock(c.t, c.tbl, pk, c.lock); err != nil {
+		if err := e.lm.lockPolicy(c.t, c.tbl, pk, c.lock, c.policy); err != nil {
+			if errors.Is(err, errSkipRow) { // SKIP LOCKED：这一行被别人锁着，跳过，取下一行
+				firstUniq = false
+				continue
+			}
 			return nil, err
 		}
 		row, ok2 := c.currentRow(pk)

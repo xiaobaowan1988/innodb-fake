@@ -276,3 +276,16 @@ e.tmu、dmu、pmu 都是叶子锁，内部不再取别的锁
      （这是与"静默忽略外键"的 MyISAM 式行为不同的有意选择。）
   **回归测试**：`txn_check.py` 增加队列公平、NOWAIT、SKIP LOCKED、一致性快照场景（与 InnoDB 对照）；
   外键拒绝与锁升级例外没有 InnoDB 可对照，放在 Go 单测和 `concurrency_audit.py` 的断言里。
+  **修复结果**（v8 的 4 个问题）：
+  1. 队列公平：行锁等待队列按到达顺序；等待者唤醒后保持位置（`wakeAll` 关闭并替换它的 channel）；放弃/死锁牺牲者离开时唤醒后面的等待者；
+     锁升级不排队；purge 的 `tryLock` 在有人排队时让路。Go 单测：FIFO、写者不被重叠的读者饿死、升级不被人为造成死锁、
+     放弃后唤醒后面的等待者。4 个变异检查（插队、升级也排队、放弃不唤醒、SKIP 不跳过）全被抓到。
+     **与 InnoDB 的有意差异**：A 持 S、B 等 X、A 升级 X——InnoDB 报死锁，本引擎让 A 升级成功。
+  2. NOWAIT / SKIP LOCKED：游标带等待策略，`GetRowPolicy` 同理；`CursorOpen`/`GetRow` 的 cgo 接口各增加一个参数。
+  3. 一致性快照：`hton->start_consistent_snapshot` + `MyEngine_TxnSnapshot`（RR/SERIALIZABLE 下立即建立视图）。
+  4. 外键：**服务器对没有 `HTON_SUPPORTS_FOREIGN_KEYS` 的引擎，在调用 `create()` 之前就把外键从表定义里丢掉了**，
+     所以最初写的"检查 dd 表定义里的外键"是死代码（实测外键仍被接受）。引擎唯一能看到外键子句的地方是当前语句的
+     `thd->lex->alter_info->key_list`（`KEYTYPE_FOREIGN`），现在改成检查它；建表和 `ALTER TABLE ADD FOREIGN KEY` 都返回 1478。
+     这依赖服务器内部结构，换 MySQL 版本可能要调整。
+  **回归**：`go test -race -count=2`、216 个结果集、59 个场景（新增 4 个）、并发检查、`concurrency_audit.py`（含外键断言）、
+  锁超时与死锁场景全部通过；引擎核心基准无明显变化。

@@ -472,6 +472,40 @@ def kill_query_interrupts_lock_wait(c):
     c.run("B", "SELECT v FROM t WHERE id=1")                        # 被杀的只是那条语句，连接和 A 的提交都不受影响
     c.run("B", "UPDATE t SET v=300 WHERE id=1"); c.run("B", "SELECT v FROM t WHERE id=1")
 
+# ------------------------------------------------------------------ 锁队列公平性、NOWAIT / SKIP LOCKED、一致性快照
+@scenario
+def lock_queue_fifo(c):
+    c.conn("A"); c.conn("B"); c.conn("C")
+    c.run("A", "BEGIN"); c.run("A", "SELECT v FROM t WHERE id=1 FOR SHARE")
+    hb = c.start("B", "UPDATE t SET v=v+1 WHERE id=1"); c.blocked(hb)          # 写者在等
+    hc = c.start("C", "SELECT v FROM t WHERE id=1 FOR SHARE"); c.blocked(hc)    # 后来的读者必须排在写者后面，不能插队
+    c.run("A", "COMMIT"); c.join(hb); c.join(hc)                                 # C 读到的是 B 提交之后的值
+
+@scenario
+def nowait_fails_immediately(c):
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "SELECT v FROM t WHERE id=1 FOR UPDATE")
+    t0 = time.time(); r = c.run("B", "SELECT v FROM t WHERE id=1 FOR UPDATE NOWAIT")
+    c.log.append(f"B: returned_within_2s={time.time()-t0 < 2}")
+    c.run("B", "SELECT v FROM t WHERE id=2 FOR UPDATE NOWAIT")                    # 没被锁的行不受影响
+    c.run("A", "ROLLBACK")
+
+@scenario
+def skip_locked_skips_rows(c):
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "SELECT v FROM t WHERE id=2 FOR UPDATE")
+    c.run("B", "BEGIN"); c.run("B", "SELECT id FROM t ORDER BY id FOR UPDATE SKIP LOCKED")   # 只应得到 1、3
+    c.run("B", "SELECT id FROM t WHERE id=2 FOR UPDATE SKIP LOCKED")                          # 被锁的行：空结果
+    c.run("B", "ROLLBACK"); c.run("A", "ROLLBACK")
+
+@scenario
+def consistent_snapshot_at_start(c):
+    c.conn("A"); c.conn("B")
+    c.run("A", "START TRANSACTION WITH CONSISTENT SNAPSHOT")
+    c.run("B", "UPDATE t SET v=99 WHERE id=1")
+    c.run("A", "SELECT v FROM t WHERE id=1")                                      # 快照在 START 时建立：仍是 10
+    c.run("A", "COMMIT"); c.run("A", "SELECT v FROM t WHERE id=1")
+
 NEEDS_TIMEOUT = {"lock_wait_timeout"}
 
 def run_one(a, name, eng):

@@ -34,6 +34,7 @@ const (
 	rcDeadlock = 5
 	rcTimeout  = 6
 	rcKilled   = 7 // 连接被 KILL，等待被打断
+	rcNoWait   = 8 // NOWAIT：需要等待的行锁请求立即失败
 )
 
 var eng = NewEngine()
@@ -96,6 +97,8 @@ func rcOf(err error, dupIdx *C.int) C.int {
 		return rcTimeout
 	case errors.Is(err, ErrKilled):
 		return rcKilled
+	case errors.Is(err, ErrNoWait):
+		return rcNoWait
 	}
 	return rcNotFound
 }
@@ -169,6 +172,11 @@ func MyEngine_TxnSetKill(h C.ulonglong, fn, thd unsafe.Pointer) {
 	txnOf(h).SetKillCheck(func() bool { return C.call_kill_fn(fn, thd) != 0 })
 }
 
+// TxnSnapshot 立即建立一致性读视图（START TRANSACTION WITH CONSISTENT SNAPSHOT）。
+//
+//export MyEngine_TxnSnapshot
+func MyEngine_TxnSnapshot(h C.ulonglong) { txnOf(h).Snapshot() }
+
 // TxnEnd 结束事务并释放句柄：commit != 0 提交，否则回滚。
 //
 //export MyEngine_TxnEnd
@@ -236,8 +244,8 @@ func copyOut(src []byte, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t
 // GetRow 按主键读一行；lockMode: 0 一致性读，1 S 锁，2 X 锁。
 //
 //export MyEngine_GetRow
-func MyEngine_GetRow(th, tbh C.ulonglong, pk unsafe.Pointer, pklen C.size_t, lockMode C.int, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
-	row, err := eng.GetRow(txnOf(th), tblOf(tbh), bytesOf(pk, pklen), int(lockMode))
+func MyEngine_GetRow(th, tbh C.ulonglong, pk unsafe.Pointer, pklen C.size_t, lockMode, waitPolicy C.int, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
+	row, err := eng.GetRowPolicy(txnOf(th), tblOf(tbh), bytesOf(pk, pklen), int(lockMode), int(waitPolicy))
 	if err != nil {
 		return rcOf(err, nil)
 	}
@@ -247,8 +255,9 @@ func MyEngine_GetRow(th, tbh C.ulonglong, pk unsafe.Pointer, pklen C.size_t, loc
 // ---------------------------------------------------------------- 游标
 
 //export MyEngine_CursorOpen
-func MyEngine_CursorOpen(th, tbh C.ulonglong, idx C.int, lockMode C.int, pkWidth C.int) C.ulonglong {
+func MyEngine_CursorOpen(th, tbh C.ulonglong, idx C.int, lockMode C.int, pkWidth C.int, waitPolicy C.int) C.ulonglong {
 	c := eng.OpenCursor(txnOf(th), tblOf(tbh), int(idx), int(lockMode), int(pkWidth))
+	c.SetWaitPolicy(int(waitPolicy))
 	return C.ulonglong(cgo.NewHandle(c))
 }
 

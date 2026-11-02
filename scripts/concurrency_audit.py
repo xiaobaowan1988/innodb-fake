@@ -85,3 +85,13 @@ if __name__ == "__main__":
              ("DELETE+INSERT 结束后的行数 (期望 30)", lambda r: str(r[5])),
              ("残留的行锁/间隙锁（被阻塞的探测数，期望 0）", lambda r: str(len(r[6])))]
     for name, f in items: print(f"{name:58s} {f(rows[0]):>22s} {f(rows[1]):>22s}")
+
+    # 外键：MyEngine 不支持，必须明确拒绝，不能像 MyISAM 那样静默忽略（那样孤儿行会悄悄写进去）。没有 InnoDB 可对照（它支持）。
+    c = conn(); fk_ok = True; detail = []
+    for sql in ["DROP TABLE IF EXISTS fk_c", "DROP TABLE IF EXISTS fk_p", "CREATE TABLE fk_p (id INT PRIMARY KEY) ENGINE=MyEngine"]: q(c, sql)
+    r1 = q(c, "CREATE TABLE fk_c (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fk_p(id)) ENGINE=MyEngine")
+    q(c, "CREATE TABLE fk_c (id INT PRIMARY KEY, pid INT) ENGINE=MyEngine")
+    r2 = q(c, "ALTER TABLE fk_c ADD FOREIGN KEY (pid) REFERENCES fk_p(id)")
+    r3 = q(c, "ALTER TABLE fk_c ADD INDEX ip(pid)")
+    ok = r1[0] == "err" and r1[1] == 1478 and r2[0] == "err" and r2[1] == 1478 and r3[0] == "ok"
+    print(f"{'外键：建表/ALTER 带外键应被拒绝(1478)，普通 ALTER 不受影响':58s} {'--':>22s} {('OK' if ok else 'FAIL ' + str((r1, r2, r3))):>22s}")
