@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "mysqld_error.h"
@@ -424,12 +426,17 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
     case HA_READ_PREFIX_LAST_OR_PREV: mode = SEEK_PREFIX_LAST; break;
     default: return HA_ERR_UNSUPPORTED;
   }
-  // 把 key 格式还原进 record[0]，再按 Field 编码成与存储一致的可比较键
+  // 把 key 格式还原进私有缓冲区（绝不能写 record[0]：INSERT ... ON DUPLICATE KEY UPDATE / REPLACE
+  // 正是在 record[0] 里放着待插入的新行，同时让我们把已存在的行读到 record[1]），再编码成可比较键。
+  KEY *ki = &table->key_info[active_index];
   uint key_len = calculate_key_len(table, active_index, keypart_map);
-  uint nparts = __builtin_popcountll(keypart_map);
-  key_restore(table->record[0], key, &table->key_info[active_index], key_len);
+  // HA_WHOLE_KEY 是全 1 位图，popcount 会远超索引列数，必须截断
+  uint nparts = std::min<uint>(__builtin_popcountll(keypart_map), ki->user_defined_key_parts);
+  if (key_scratch.size() < table->s->rec_buff_length) key_scratch.resize(table->s->rec_buff_length);
+  memset(key_scratch.data(), 0, key_scratch.size());
+  key_restore(key_scratch.data(), key, ki, key_len);
   std::string k;
-  key_for(active_index, table->record[0], nparts, k);
+  key_for(active_index, key_scratch.data(), nparts, k);
   int e = seek_fetch(buf, k.data(), k.size(), mode);
   if (e == HA_ERR_END_OF_FILE && find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
     e = seek_fetch(buf, k.data(), k.size(), SEEK_LE);

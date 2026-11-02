@@ -155,7 +155,7 @@ type ReadView struct{ snapTS uint64; me *Txn }
 ## 6. 阶段与完成标准
 - [x] **P1 纯 Go 核心**：`engine.go` + 单测通过（含 `-race`）。12 个测试；另做了 6 个变异检查（可见性恒真、二级索引不核对、死锁检测失效、不取加锁读、回滚不弹版本、purge 过度）均被测试抓到。
 - [x] **P2 接入 MySQL**：cgo 层与 C++ handler 改造；`compare_innodb.sh` 仍 147 个结果集一致；`concurrency_check.py` 四项异常数均为 0（UNIQUE 加压到 2000 值×8 客户端，连续 2 次 0 重复；此前每轮都重复）。
-- [ ] **P3 场景验证**：`txn_check.py` 全部与 InnoDB 一致；`concurrency_check.py` 四项异常数均为 0。
+- [x] **P3 场景验证**：`txn_check.py` 21 个场景（含锁等待超时，需 `MYENGINE_LOCK_WAIT_SECS=2` 与 `--timeout-tests`）全部与 InnoDB 一致；`concurrency_check.py` 四项异常数均为 0；`compare_innodb.sh` 147 个结果集一致；`go test -race` 通过。
 - [ ] **P4 收尾**：性能重测、文档更新、限制清单。
 
 ## 7. 风险
@@ -191,3 +191,12 @@ type ReadView struct{ snapTS uint64; me *Txn }
      （原来的 `MYENGINE_QUIET` 不再使用）。
   6. **`start_stmt` 也要实现**（`LOCK TABLES` 场景下 MySQL 调它而不是 `external_lock`），与 `external_lock` 共用 `begin_stmt`。
   7. 表级写锁在 `store_lock` 里降级为 `TL_WRITE_ALLOW_WRITE`（InnoDB 的做法），原始锁类型另存用来决定行锁模式。
+- v4（P3 完成时）：
+  1. **验证中发现并修复两个 handler bug**（都不属于事务设计本身，但此前没有测试覆盖）：
+     - `index_read_map` 用 `popcount(keypart_map)` 当键的列数。`INSERT … ON DUPLICATE KEY UPDATE`/`REPLACE`
+       内部用 `HA_WHOLE_KEY`（全 1 位图）调用，得到 64，越界读取 `key_part`，**崩溃 mysqld**。现改为与索引列数取较小值。
+     - 把查找键 `key_restore` 到 `record[0]`，会覆盖这类语句放在 `record[0]` 里的待插入新行
+       （同时它们让引擎把已有行读到 `record[1]`）。现改用私有缓冲区 `key_scratch`。
+  2. **`txn_check.py` 的死锁场景不比较"谁是牺牲者"**：InnoDB 与本引擎的挑选规则不同，只检查"恰好一个 1213，另一个成功"。
+  3. **已用实验确认"无间隙锁"的限制**：A 在 `BEGIN` 后对 `id >= 2` 做 `SELECT … FOR UPDATE`，B 往该范围插入——
+     InnoDB 阻塞 B（间隙锁），本引擎不阻塞，A 再次 `FOR UPDATE` 读到 3 行（幻读）。这是计划里的非目标，写入文档。

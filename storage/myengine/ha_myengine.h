@@ -29,6 +29,7 @@ class ha_myengine : public handler {
   int row_lock = 0;               // 本语句对该表的行锁模式：0 一致性读，1 S，2 X
   enum thr_lock_type stmt_lock_type = TL_UNLOCK;  // store_lock 收到的原始锁类型
   bool scan_started = false;
+  std::vector<uchar> key_scratch;  // index_read_map 还原查找键用的私有缓冲区
   uint last_dup_key = 0;
 
   void key_for(uint idx, const uchar *rec, uint nparts, std::string &out) const;
