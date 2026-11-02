@@ -8,7 +8,7 @@
 用法: scripts/fuzz_diff.py --socket /tmp/my.sock [--seeds 0-39] [--steps 70] [--sessions 3]
 要求 mysqld 以 MYENGINE_LOCK_WAIT_SECS=3 启动；脚本会把 InnoDB 的 innodb_lock_wait_timeout 也设成 3 秒。
 """
-import argparse, random, sys, threading, time
+import argparse, os, random, sys, threading, time
 import pymysql
 
 SOCK = None
@@ -85,7 +85,7 @@ PURGE_GAP = 0.12
 def one_run(seed, steps, nsess, isos):
     logs = {}
     for eng in ("InnoDB", "MyEngine"):
-        db = f"fz_{eng}"
+        db = f"fz_{eng}_{os.getpid()}"
         root = conn("mysql"); cur = root.cursor()
         cur.execute(f"CREATE DATABASE IF NOT EXISTS {db}"); cur.execute(f"USE {db}"); cur.execute("DROP TABLE IF EXISTS t")
         cur.execute(f"CREATE TABLE t (id INT PRIMARY KEY, k INT, u INT, v INT, KEY ik(k), UNIQUE KEY uu(u)) ENGINE={eng}")
