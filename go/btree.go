@@ -24,8 +24,9 @@ type node struct {
 }
 
 type BTree struct {
-	root *node
-	size int
+	root    *node
+	size    int
+	version uint64 // 每次新增/删除键自增；游标据此判断缓存的位置是否仍有效
 }
 
 func NewBTree() *BTree { return &BTree{root: &node{leaf: true}} }
@@ -98,6 +99,7 @@ func (t *BTree) Put(key, val []byte, overwrite bool) bool {
 	}
 	if !exists {
 		t.size++
+		t.version++
 	}
 	return true
 }
@@ -157,6 +159,7 @@ func (t *BTree) Delete(key []byte) bool {
 		return false
 	}
 	t.size--
+	t.version++
 	if !t.root.leaf && len(t.root.children) == 1 {
 		t.root = t.root.children[0]
 	}

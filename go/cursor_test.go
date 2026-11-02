@@ -1,0 +1,208 @@
+package main
+
+import (
+	"bytes"
+	"math/rand"
+	"sort"
+	"testing"
+)
+
+func newTbl() *table { return &table{trees: map[int]*BTree{}} }
+
+// 键 = 2 字节"前缀"部分 + 2 字节后缀，便于测试前缀匹配类模式。
+func k2(a, b int) []byte { return []byte{byte(a >> 8), byte(a), byte(b >> 8), byte(b)} }
+
+func sortedKeys(m map[string]bool) [][]byte {
+	var r [][]byte
+	for k := range m {
+		r = append(r, []byte(k))
+	}
+	sort.Slice(r, func(i, j int) bool { return bytes.Compare(r[i], r[j]) < 0 })
+	return r
+}
+
+// 所有 seek 模式（含前缀）对照暴力实现。
+func TestSeekModesAgainstBruteForce(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	tb := newTbl()
+	set := map[string]bool{}
+	for i := 0; i < 600; i++ {
+		k := k2(rng.Intn(40), rng.Intn(40))
+		tb.tree(0).Put(k, k, true)
+		set[string(k)] = true
+	}
+	keys := sortedKeys(set)
+	c := &cursor{tbl: tb, idx: 0}
+	for trial := 0; trial < 3000; trial++ {
+		var q []byte
+		if rng.Intn(2) == 0 {
+			q = k2(rng.Intn(45), rng.Intn(45)) // 完整键
+		} else {
+			a := rng.Intn(45)
+			q = []byte{byte(a >> 8), byte(a)} // 仅前缀
+		}
+		for mode := seekExact; mode <= seekPrefixLast; mode++ {
+			var want []byte
+			switch mode {
+			case seekExact:
+				for _, k := range keys {
+					if bytes.HasPrefix(k, q) {
+						want = k
+						break
+					}
+				}
+			case seekGE:
+				for _, k := range keys {
+					if bytes.Compare(k, q) >= 0 {
+						want = k
+						break
+					}
+				}
+			case seekAfter:
+				for _, k := range keys {
+					if bytes.Compare(k, q) > 0 && !bytes.HasPrefix(k, q) {
+						want = k
+						break
+					}
+				}
+			case seekLE:
+				for i := len(keys) - 1; i >= 0; i-- {
+					if bytes.Compare(keys[i], q) <= 0 || bytes.HasPrefix(keys[i], q) {
+						want = keys[i]
+						break
+					}
+				}
+			case seekLT:
+				for i := len(keys) - 1; i >= 0; i-- {
+					if bytes.Compare(keys[i], q) < 0 {
+						want = keys[i]
+						break
+					}
+				}
+			case seekFirst:
+				want = keys[0]
+			case seekLast:
+				want = keys[len(keys)-1]
+			case seekPrefixLast:
+				for i := len(keys) - 1; i >= 0; i-- {
+					if bytes.HasPrefix(keys[i], q) {
+						want = keys[i]
+						break
+					}
+				}
+			}
+			rc := c.seek(q, mode)
+			if (want == nil) != (rc != rcOK) || (want != nil && !bytes.Equal(c.key, want)) {
+				t.Fatalf("mode %d q=%x: got rc=%d key=%x want %x", mode, q, rc, c.key, want)
+			}
+		}
+	}
+}
+
+// 全量正向/反向扫描：树未变时走快路径，必须与排序结果一致。
+func TestFullScanFastPath(t *testing.T) {
+	tb := newTbl()
+	n := 5000
+	for i := 0; i < n; i++ {
+		tb.tree(0).Put(k(i), k(i), false)
+	}
+	c := &cursor{tbl: tb, idx: 0}
+	i := 0
+	for rc := c.seek(nil, seekFirst); rc == rcOK; rc = c.step(1) {
+		if !bytes.Equal(c.key, k(i)) {
+			t.Fatalf("forward %d: got %x", i, c.key)
+		}
+		i++
+	}
+	if i != n {
+		t.Fatalf("forward count %d", i)
+	}
+	for rc := c.seek(nil, seekLast); rc == rcOK; rc = c.step(-1) {
+		i--
+		if !bytes.Equal(c.key, k(i)) {
+			t.Fatalf("backward %d: got %x", i, c.key)
+		}
+	}
+	if i != 0 {
+		t.Fatalf("backward count, i=%d", i)
+	}
+}
+
+// 扫描过程中随机插入/删除（含删除游标当前所在的键），游标必须始终返回"当前键之后最近的存活键"。
+func TestScanWithConcurrentModification(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	tb := newTbl()
+	live := map[int]bool{}
+	for i := 0; i < 3000; i++ {
+		tb.tree(0).Put(k(i*2), nil, false)
+		live[i*2] = true
+	}
+	next := func(after int) (int, bool) { // 暴力：> after 的最小存活键
+		best, ok := 0, false
+		for v := range live {
+			if v > after && (!ok || v < best) {
+				best, ok = v, true
+			}
+		}
+		return best, ok
+	}
+	c := &cursor{tbl: tb, idx: 0}
+	c.seek(nil, seekFirst)
+	cur := 0
+	for steps := 0; steps < 1500; steps++ {
+		// 随机改动树
+		for m := rng.Intn(4); m > 0; m-- {
+			v := rng.Intn(6200)
+			switch rng.Intn(3) {
+			case 0:
+				if !live[v] {
+					tb.tree(0).Put(k(v), nil, false)
+					live[v] = true
+				}
+			case 1:
+				if live[v] {
+					tb.tree(0).Delete(k(v))
+					delete(live, v)
+				}
+			case 2: // 删除游标当前所在的键
+				if live[cur] {
+					tb.tree(0).Delete(k(cur))
+					delete(live, cur)
+				}
+			}
+		}
+		want, ok := next(cur)
+		rc := c.step(1)
+		if ok != (rc == rcOK) {
+			t.Fatalf("step %d: ok=%v rc=%d", steps, ok, rc)
+		}
+		if !ok {
+			return
+		}
+		got := int(k2int(c.key))
+		if got != want {
+			t.Fatalf("step %d: after %d got %d want %d", steps, cur, got, want)
+		}
+		cur = got
+	}
+}
+
+func k2int(b []byte) uint64 {
+	var v uint64
+	for _, x := range b {
+		v = v<<8 | uint64(x)
+	}
+	return v
+}
+
+// 树里原本没有索引时，读路径不能创建/修改 map（读锁下并发安全的前提）。
+func TestReadPathDoesNotMutate(t *testing.T) {
+	tb := newTbl()
+	c := &cursor{tbl: tb, idx: 3}
+	if c.seek(nil, seekFirst) == rcOK || len(tb.trees) != 0 {
+		t.Fatal("read path mutated table or found data in empty index")
+	}
+	if emptyTree.Len() != 0 {
+		t.Fatal("shared emptyTree was modified")
+	}
+}

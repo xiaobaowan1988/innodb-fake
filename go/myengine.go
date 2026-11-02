@@ -7,31 +7,11 @@ package main
 import "C"
 
 import (
-	"bytes"
 	"fmt"
 	"os"
+	"runtime/cgo"
 	"sync"
 	"unsafe"
-)
-
-// 返回码约定：0 成功；1 未找到/失败；2 主键重复；3 缓冲区不足。
-const (
-	rcOK       = 0
-	rcNotFound = 1
-	rcDup      = 2
-	rcTooSmall = 3
-)
-
-// Seek 模式（与 C++ 侧 ha_rkey_function 的映射在 ha_myengine.cc 中完成）。
-const (
-	seekExact      = 0 // 第一个以 key 为前缀的条目
-	seekGE         = 1 // >= key
-	seekAfter      = 2 // 第一个不以 key 为前缀且 > key 的条目
-	seekLE         = 3 // 最后一个 <= key（含以 key 为前缀者）
-	seekLT         = 4 // < key
-	seekFirst      = 5
-	seekLast       = 6
-	seekPrefixLast = 7 // 最后一个以 key 为前缀的条目
 )
 
 var verbose = os.Getenv("MYENGINE_VERBOSE") != ""
@@ -42,37 +22,20 @@ func logf(format string, args ...interface{}) {
 	}
 }
 
-type table struct {
-	trees map[int]*BTree // idx -> B+ 树；0 为主索引(key=主键, val=整行)
-}
-
-func (t *table) tree(idx int) *BTree {
-	bt := t.trees[idx]
-	if bt == nil {
-		bt = NewBTree()
-		t.trees[idx] = bt
-	}
-	return bt
-}
-
-type cursor struct {
-	tbl   *table
-	idx   int
-	key   []byte
-	val   []byte
-	valid bool
-}
-
+// 锁规则：
+//   - mu 是读写锁：Get/Count/Cursor{Seek,Step,Key,Val} 拿读锁，可并行；
+//     Create/Drop/Rename/Put/Delete 拿写锁，与一切读写互斥。
+//   - 读锁下禁止修改任何 map 或树（所以只读路径用 treeRO，不用 tree）。
+//   - 一个游标同一时刻只被一个 MySQL 线程使用，游标内部状态无需额外加锁。
 var (
-	mu        sync.Mutex // 全局大锁：简单优先，后续可细化
-	tables    = map[string]*table{}
-	cursors   = map[uint64]*cursor{}
-	nextCurID uint64
+	mu     sync.RWMutex
+	tables = map[string]*table{}
 )
 
+// getTable 不存在则创建（mysqld 重启后数据字典里有表而内存里没有，按空表处理）。写锁下调用。
 func getTable(name string) *table {
 	t := tables[name]
-	if t == nil { // mysqld 重启后数据字典里有表而内存里没有，按空表处理
+	if t == nil {
 		t = &table{trees: map[int]*BTree{}}
 		tables[name] = t
 	}
@@ -129,11 +92,19 @@ func MyEngine_Rename(from, to *C.char) C.int {
 	return rcOK
 }
 
+// lookup 在读锁下查表；调用者必须持有读锁。表不存在时返回空表（只读，不写入 map）。
+func lookup(name string) *table {
+	if t := tables[name]; t != nil {
+		return t
+	}
+	return &table{trees: map[int]*BTree{}}
+}
+
 //export MyEngine_Count
 func MyEngine_Count(name *C.char) C.longlong {
-	mu.Lock()
-	defer mu.Unlock()
-	return C.longlong(getTable(C.GoString(name)).tree(0).Len())
+	mu.RLock()
+	defer mu.RUnlock()
+	return C.longlong(lookup(C.GoString(name)).treeRO(0).Len())
 }
 
 //export MyEngine_Put
@@ -168,136 +139,82 @@ func copyOut(src []byte, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t
 
 //export MyEngine_Get
 func MyEngine_Get(name *C.char, idx C.int, key unsafe.Pointer, klen C.size_t, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	v, ok := getTable(C.GoString(name)).tree(int(idx)).Get(bytesOf(key, klen))
+	mu.RLock()
+	defer mu.RUnlock()
+	v, ok := lookup(C.GoString(name)).treeRO(int(idx)).Get(bytesOf(key, klen))
 	if !ok {
 		return rcNotFound
 	}
 	return copyOut(v, out, capacity, outlen)
 }
 
+// 游标句柄用 runtime/cgo.Handle：查找无锁，不再经过全局 map。
+
 //export MyEngine_CursorOpen
 func MyEngine_CursorOpen(name *C.char, idx C.int) C.ulonglong {
-	mu.Lock()
-	defer mu.Unlock()
-	nextCurID++
-	cursors[nextCurID] = &cursor{tbl: getTable(C.GoString(name)), idx: int(idx)}
-	return C.ulonglong(nextCurID)
+	n := C.GoString(name)
+	mu.RLock()
+	t := tables[n]
+	mu.RUnlock()
+	if t == nil { // 正常情况下 handler.open 已创建；兜底
+		mu.Lock()
+		t = getTable(n)
+		mu.Unlock()
+	}
+	return C.ulonglong(cgo.NewHandle(&cursor{tbl: t, idx: int(idx)}))
 }
 
 //export MyEngine_CursorClose
 func MyEngine_CursorClose(cur C.ulonglong) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	delete(cursors, uint64(cur))
+	if cur != 0 {
+		cgo.Handle(cur).Delete()
+	}
 	return rcOK
 }
 
-func (c *cursor) set(p pos) C.int {
-	if !p.valid() {
-		c.valid = false
-		return rcNotFound
+func cur(h C.ulonglong) *cursor {
+	if h == 0 {
+		return nil
 	}
-	c.key, c.val, c.valid = p.key(), p.val(), true
-	return rcOK
-}
-
-// prefixSucc 返回比所有以 k 为前缀的 key 都大的最小 key；不存在返回 nil。
-func prefixSucc(k []byte) []byte {
-	s := append([]byte(nil), k...)
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] != 0xFF {
-			s[i]++
-			return s[:i+1]
-		}
-	}
-	return nil
+	return cgo.Handle(h).Value().(*cursor)
 }
 
 //export MyEngine_CursorSeek
-func MyEngine_CursorSeek(cur C.ulonglong, key unsafe.Pointer, klen C.size_t, mode C.int) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	c := cursors[uint64(cur)]
+func MyEngine_CursorSeek(h C.ulonglong, key unsafe.Pointer, klen C.size_t, mode C.int) C.int {
+	c := cur(h)
 	if c == nil {
 		return rcNotFound
 	}
-	t := c.tbl.tree(c.idx)
-	k := append([]byte(nil), bytesOf(key, klen)...)
-	switch int(mode) {
-	case seekExact:
-		p := t.LowerBound(k)
-		if p.valid() && bytes.HasPrefix(p.key(), k) {
-			return c.set(p)
-		}
-		return c.set(pos{})
-	case seekGE:
-		return c.set(t.LowerBound(k))
-	case seekAfter:
-		if s := prefixSucc(k); s != nil {
-			return c.set(t.LowerBound(s))
-		}
-		return c.set(pos{})
-	case seekLE:
-		if s := prefixSucc(k); s != nil {
-			return c.set(t.LastLess(s))
-		}
-		return c.set(t.Last())
-	case seekLT:
-		return c.set(t.LastLess(k))
-	case seekFirst:
-		return c.set(t.First())
-	case seekLast:
-		return c.set(t.Last())
-	case seekPrefixLast:
-		var p pos
-		if s := prefixSucc(k); s != nil {
-			p = t.LastLess(s)
-		} else {
-			p = t.Last()
-		}
-		if p.valid() && bytes.HasPrefix(p.key(), k) {
-			return c.set(p)
-		}
-		return c.set(pos{})
-	}
-	return rcNotFound
+	mu.RLock()
+	defer mu.RUnlock()
+	return C.int(c.seek(bytesOf(key, klen), int(mode)))
 }
 
-// CursorStep: dir>0 下一条，dir<0 上一条。按 key 重新定位，扫描期间并发增删不会失效。
+// CursorStep: dir>0 下一条，dir<0 上一条。
 //
 //export MyEngine_CursorStep
-func MyEngine_CursorStep(cur C.ulonglong, dir C.int) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	c := cursors[uint64(cur)]
-	if c == nil || !c.valid {
+func MyEngine_CursorStep(h C.ulonglong, dir C.int) C.int {
+	c := cur(h)
+	if c == nil {
 		return rcNotFound
 	}
-	t := c.tbl.tree(c.idx)
-	if dir > 0 {
-		return c.set(t.UpperBound(c.key))
-	}
-	return c.set(t.LastLess(c.key))
+	mu.RLock()
+	defer mu.RUnlock()
+	return C.int(c.step(int(dir)))
 }
 
 //export MyEngine_CursorKey
-func MyEngine_CursorKey(cur C.ulonglong, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	c := cursors[uint64(cur)]
+func MyEngine_CursorKey(h C.ulonglong, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
+	c := cur(h)
 	if c == nil || !c.valid {
 		return rcNotFound
 	}
-	return copyOut(c.key, out, capacity, outlen)
+	return copyOut(c.key, out, capacity, outlen) // key/val 已是游标自己持有的切片，无需加锁
 }
 
 //export MyEngine_CursorVal
-func MyEngine_CursorVal(cur C.ulonglong, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
-	mu.Lock()
-	defer mu.Unlock()
-	c := cursors[uint64(cur)]
+func MyEngine_CursorVal(h C.ulonglong, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
+	c := cur(h)
 	if c == nil || !c.valid {
 		return rcNotFound
 	}
