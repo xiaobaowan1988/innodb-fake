@@ -888,6 +888,45 @@ func TestUpdateToExistingPkKeepsOnlySharedLock(t *testing.T) {
 	}
 }
 
+// RC 下整条语句回滚后，被回滚的插入不留行锁；RR 下保留（InnoDB 的残留记录）。
+func TestRollbackStmtReleasesInsertLockUnderRC(t *testing.T) {
+	for _, iso := range []int{isoReadCommitted, isoRepeatableRead} {
+		e, tb := newTestEngine(t)
+		s := e.Begin(isoRepeatableRead)
+		mustInsert(t, e, s, tb, 2, 1)
+		e.Commit(s)
+		a, b := e.Begin(iso), e.Begin(iso)
+		a.StmtBegin(iso)
+		mustInsert(t, e, a, tb, 5, 5)
+		if err := e.Insert(a, tb, pk4(2), row8(9), secs(9, false)); err == nil {
+			t.Fatal("want dup")
+		}
+		e.RollbackStmt(a)
+		a.StmtEnd()
+		res := make(chan error, 1)
+		go func() { res <- e.Insert(b, tb, pk4(5), row8(6), secs(6, false)) }()
+		finished := false
+		select {
+		case err := <-res:
+			finished = true
+			if iso != isoReadCommitted {
+				t.Fatalf("RR must keep the lock, got %v", err)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(300 * time.Millisecond):
+			if iso == isoReadCommitted {
+				t.Fatal("RC: rolled-back insert left its row lock")
+			}
+		}
+		e.Rollback(a)
+		if !finished {
+			<-res
+		}
+	}
+}
+
 // RC 下加锁扫描遇到不匹配的行，UnlockLast 放掉它；RR 下不放。
 func TestUnlockLastOnlyUnderReadCommitted(t *testing.T) {
 	for _, iso := range []int{isoReadCommitted, isoRepeatableRead} {

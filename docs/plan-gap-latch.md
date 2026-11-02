@@ -379,3 +379,9 @@ SQL 场景 63/63 与 InnoDB 一致（新增 `entry_lock_dup_error_only_blocks_in
     InnoDB 只在 8 上留 S 锁；我们先对新主键取了 X，之后别人的 `INSERT IGNORE (8,..)`（要 S）被无谓阻塞。
     修法同 `Insert`：先不加锁看新主键是否有活行，有则取 S 并确认后报重复；否则取 X；竞态下降级。
     验证：单元测试 `TestUpdateToExistingPkKeepsOnlySharedLock`（回退修复应失败）+ txn_check 场景 + 差分重跑 seed 196。
+
+13. **RC 下语句回滚后，被回滚的插入不留行锁**：`INSERT (5,..),(2,..)`（2 已存在）整条失败，InnoDB 在 RC 下没有残留，
+    别人随后 `INSERT 5` 直接成功；我们的 `RollbackStmt` 保留了 5 上的 X 锁，把它挡住（seed 122 最小化）。
+    RR 下 InnoDB 留有已删除标记的残留记录，别人仍被挡——这是已知差异的另一面，我们 RR 下保持现状（两边都挡）。
+    修法：`Txn.fresh` 记录本语句里新取得行锁的插入；RC 下 `RollbackStmt` 撤销之后，凡是行已不属于本事务的就放锁。
+    验证：单元测试 `TestRollbackStmtReleasesInsertLockUnderRC`（RC 放、RR 不放）+ txn_check 场景 + 差分重跑 seed 122。

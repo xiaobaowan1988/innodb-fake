@@ -136,6 +136,11 @@ type undoRec struct {
 	ver  *rowVer
 }
 
+type freshIns struct {
+	tbl *table
+	pk  []byte
+}
+
 type ReadView struct {
 	snap uint64
 	me   *Txn
@@ -151,6 +156,7 @@ type Txn struct {
 	timeout  time.Duration
 	undo     []undoRec
 	stmtBeg  int
+	fresh    []freshIns  // 本语句里新取得行锁的插入（RC 下语句回滚时放锁）
 	inStmt   bool        // 正在一条（顶层）语句之中：触发器/存储函数里再打开别的表不算新语句
 	killed   func() bool // 连接是否被 KILL（由 C++ 提供 thd_killed）；nil 表示不检查
 	done     bool
@@ -265,6 +271,7 @@ func (t *Txn) StmtBegin(iso int) {
 	}
 	t.inStmt = true
 	t.stmtBeg = len(t.undo)
+	t.fresh = t.fresh[:0]
 	if iso != isoRepeatableRead && iso != isoSerializable {
 		t.view = nil
 		t.viewSnap.Store(-1)
@@ -377,8 +384,26 @@ func (e *Engine) Rollback(t *Txn) {
 	close(t.doneCh)
 }
 
-// RollbackStmt 只撤销当前语句的修改，行锁保留（与 InnoDB 一致）。
-func (e *Engine) RollbackStmt(t *Txn) { e.undoTo(t, t.stmtBeg) }
+// RollbackStmt 只撤销当前语句的修改，行锁保留（与 InnoDB 一致；RC 下新插入行的锁例外，见下）。
+// READ COMMITTED 下 InnoDB 回滚掉的插入没有残留（可见的只是被 purge 的记录），本语句新取得锁的那些行锁随之放掉；
+// RR 下 InnoDB 留有已删除标记的残留记录，锁保留。
+func (e *Engine) RollbackStmt(t *Txn) {
+	e.undoTo(t, t.stmtBeg)
+	if t.iso == isoReadCommitted {
+		for _, f := range t.fresh {
+			mine := false
+			f.tbl.pri.GetFn(f.pk, func(v any) {
+				if h := v.(*rowHead); h.head != nil && h.head.trx == t {
+					mine = true
+				}
+			})
+			if !mine {
+				e.lm.release(t, f.tbl, f.pk)
+			}
+		}
+	}
+	t.fresh = t.fresh[:0]
+}
 
 func (t *Txn) Savepoint() int { return len(t.undo) }
 
@@ -1046,6 +1071,9 @@ func (e *Engine) Insert(t *Txn, tb *table, pk, row []byte, sec []secKey) error {
 		putSecEntries(tb, pk, v)
 		unlockIdx()
 		unlockU()
+		if !had {
+			t.fresh = append(t.fresh, freshIns{tb, append([]byte(nil), pk...)})
+		}
 		return nil
 	}
 }

@@ -574,6 +574,19 @@ def pk_change_dup_keeps_shared_lock(c):
     c.run("B", "DELETE FROM gw WHERE id=20")                                           # 要 X：被挡（收尾解除）
     c.run("A", "ROLLBACK")
 
+@scenario
+def rc_failed_multirow_insert_leaves_no_lock(c):
+    # RC：多行 INSERT 先插入新行、后一行重复而整条回滚，被回滚的新行不留锁；RR 下 InnoDB 有残留，别人被挡
+    c.conn("A"); c.conn("B"); c.conn("R"); c.conn("Q")
+    c.run("A", "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (15, 5, 0),(10, 6, 0)")   # 10 已存在 -> 整条回滚
+    c.run("B", "INSERT INTO gw VALUES (15, 7, 0)")                                     # RC：直接成功
+    c.run("A", "ROLLBACK")
+    c.run("R", "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    c.run("R", "BEGIN"); c.run("R", "INSERT INTO gw VALUES (16, 5, 0),(10, 6, 0)")
+    c.run("Q", "INSERT INTO gw VALUES (16, 8, 0)")
+    c.run("R", "ROLLBACK")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--socket", required=True)
     ap.add_argument("--only"); ap.add_argument("--timeout-tests", action="store_true"); ap.add_argument("-v", action="store_true")
