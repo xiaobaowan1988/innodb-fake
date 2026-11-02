@@ -863,3 +863,45 @@ func TestDupInsertKeepsOnlySharedLock(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// RC 下加锁扫描遇到不匹配的行，UnlockLast 放掉它；RR 下不放。
+func TestUnlockLastOnlyUnderReadCommitted(t *testing.T) {
+	for _, iso := range []int{isoReadCommitted, isoRepeatableRead} {
+		e, tb := newTestEngine(t)
+		s := e.Begin(isoRepeatableRead)
+		for i := 1; i <= 3; i++ {
+			mustInsert(t, e, s, tb, i, i)
+		}
+		e.Commit(s)
+		a := e.Begin(iso)
+		c := e.OpenCursor(a, tb, 0, lockX, 4)
+		if _, err := c.Seek(nil, seekFirst); err != nil {
+			t.Fatal(err)
+		}
+		c.UnlockLast() // 第 1 行"不匹配"
+		if _, err := c.Step(1); err != nil { // 第 2 行"匹配"，保持锁
+			t.Fatal(err)
+		}
+		get := func(id int) error {
+			ch := make(chan error, 1)
+			b := e.Begin(isoReadCommitted)
+			go func() { _, err := e.GetRow(b, tb, pk4(id), lockX); ch <- err }()
+			select {
+			case err := <-ch:
+				return err
+			case <-time.After(150 * time.Millisecond):
+				return errors.New("blocked")
+			}
+		}
+		err1, err2 := get(1), get(2)
+		wantBlocked1 := iso != isoReadCommitted
+		if (err1 != nil && err1.Error() == "blocked") != wantBlocked1 {
+			t.Fatalf("iso=%d row1: blocked=%v want %v (%v)", iso, err1, wantBlocked1, err1)
+		}
+		if err2 == nil || err2.Error() != "blocked" {
+			t.Fatalf("iso=%d row2 must stay locked, got %v", iso, err2)
+		}
+		e.Rollback(a)
+		time.Sleep(50 * time.Millisecond)
+	}
+}

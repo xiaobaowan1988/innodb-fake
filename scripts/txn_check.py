@@ -517,6 +517,21 @@ def run_one(a, name, eng):
         except Exception: pass
     return c.log
 
+@scenario
+def rc_unlocks_nonmatching_rows(c):
+    # RC 下全表加锁扫描：不满足 WHERE 的行要提前放锁（unlock_row）；匹配的行保持锁；RR 下全部保持
+    c.conn("A"); c.conn("B"); c.conn("R"); c.conn("Q")
+    c.run("A", "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    c.run("A", "BEGIN"); c.run("A", "UPDATE t SET v=v WHERE v=20")                # 非索引条件：全表扫描，只有 v=20 的行匹配
+    c.run("B", "UPDATE t SET v=v+1 WHERE id=1")                                    # 不匹配：RC 下不被挡
+    c.run("B", "UPDATE t SET v=v+1 WHERE id=2")                                    # 匹配：被挡（超时前由收尾解除）
+    c.run("A", "ROLLBACK")
+    c.run("R", "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+    c.run("R", "BEGIN"); c.run("R", "UPDATE t SET v=v WHERE v=20")
+    c.run("Q", "UPDATE t SET v=v+1 WHERE id=1")                                    # RR：全部保持锁，被挡
+    c.run("R", "ROLLBACK")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--socket", required=True)
     ap.add_argument("--only"); ap.add_argument("--timeout-tests", action="store_true"); ap.add_argument("-v", action="store_true")

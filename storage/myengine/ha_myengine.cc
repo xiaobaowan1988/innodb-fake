@@ -479,6 +479,11 @@ int ha_myengine::rnd_init(bool scan) {
   return 0;
 }
 
+// 服务器在 READ COMMITTED 下发现当前行不满足 WHERE 时调用：把这次扫描刚取到的行锁提前放掉（与 InnoDB 一致）。
+void ha_myengine::unlock_row() {
+  if (cur) MyEngine_CursorUnlockRow(cur);
+}
+
 int ha_myengine::rnd_end() {
   TRACE("");
   close_cursor();

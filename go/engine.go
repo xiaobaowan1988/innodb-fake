@@ -1092,6 +1092,14 @@ func (e *Engine) GetRowPolicy(t *Txn, tb *table, pk []byte, lock, policy int) ([
 }
 
 // Cursor 是带事务语义的游标：只返回对当前事务可见（或已加锁的最新）的行。
+// UnlockLast 放掉最近返回的那一行上本次新取的锁；仅 READ COMMITTED 下生效（RR 要保持到提交）。
+func (c *Cursor) UnlockLast() {
+	if c.lastFresh && c.t.iso == isoReadCommitted && c.lastPk != nil {
+		c.e.lm.release(c.t, c.tbl, c.lastPk)
+	}
+	c.lastFresh = false
+}
+
 type Cursor struct {
 	e       *Engine
 	t       *Txn
@@ -1115,6 +1123,10 @@ type Cursor struct {
 	bufDir  int
 	batchFn func(k []byte, v any)
 	batchN  int // 下一次预取的大小：从 2 倍增到 16，避免 LIMIT 1 之类的短扫描白白多解析
+
+	// 最近一次加锁读返回的行，及其锁是否是这次新取的（供 unlock_row：RC 下不满足 WHERE 的行提前放锁）
+	lastPk    []byte
+	lastFresh bool
 
 	// 扫描边界（见 gap.go）
 	bKind      int // 外部设置的边界（SetBound）
@@ -1334,6 +1346,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		}
 		pk := c.pk()
 		deadKey := c.raw.key
+		_, had := c.t.held[lockKey{c.tbl, string(pk)}]
 		// 加锁读：此刻没有持有任何树锁/gapMu，可以安全地等行锁；醒来后树可能变了，游标会按 key 重新定位
 		if err := e.lm.lockPolicy(c.t, c.tbl, pk, c.lock, c.policy); err != nil {
 			if errors.Is(err, errSkipRow) { // SKIP LOCKED：这一行被别人锁着，跳过，取下一行
@@ -1344,8 +1357,12 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		}
 		row, ok2 := c.currentRow(pk)
 		if ok2 {
+			c.lastPk, c.lastFresh = append(c.lastPk[:0], pk...), !had
 			c.noteReturned()
 			return row, nil
+		}
+		if !had && c.t.iso == isoReadCommitted { // RC：已删除的行不留锁（InnoDB 同）
+			c.e.lm.release(c.t, c.tbl, pk)
 		}
 		if hit && gap {
 			// 唯一键命中的那一行其实已被删除：按"未命中"处理，补登记它前面的间隙，之后按普通同键扫描继续

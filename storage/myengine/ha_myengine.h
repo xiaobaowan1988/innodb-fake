@@ -78,6 +78,7 @@ class ha_myengine : public handler {
 
   int rnd_init(bool scan) override;
   int rnd_end() override;
+  void unlock_row() override;
   int rnd_next(uchar *buf) override;
   int rnd_pos(uchar *buf, uchar *pos) override;
   void position(const uchar *record) override;

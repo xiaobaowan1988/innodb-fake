@@ -291,6 +291,15 @@ func MyEngine_CursorSeekFetch(h C.ulonglong, key unsafe.Pointer, klen C.size_t, 
 // CursorBound 设置扫描边界：kind 0 清除，1 同键前缀，2 正向终点，3 反向终点；unique 表示终点是唯一索引的全键。
 // 越过边界的第一个条目只会让它前面的间隙被锁住（RR/SERIALIZABLE 的加锁读），不会锁它的行。
 //
+// CursorUnlockRow 对应 handler::unlock_row：当前行不满足 WHERE，RC 下提前放锁。
+//
+//export MyEngine_CursorUnlockRow
+func MyEngine_CursorUnlockRow(h C.ulonglong) {
+	if c := curOf(h); c != nil {
+		c.UnlockLast()
+	}
+}
+
 //export MyEngine_CursorBound
 func MyEngine_CursorBound(h C.ulonglong, kind C.int, key unsafe.Pointer, klen C.size_t, inclusive C.int, unique C.int) {
 	if c := curOf(h); c != nil {
