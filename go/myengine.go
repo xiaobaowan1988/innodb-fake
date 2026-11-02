@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/cgo"
+	"runtime/pprof"
 	"sync"
 	"unsafe"
 )
@@ -203,6 +204,49 @@ func MyEngine_CursorStep(h C.ulonglong, dir C.int) C.int {
 	return C.int(c.step(int(dir)))
 }
 
+// CursorFetch 一次跨语言调用完成：移动游标(step: +1 下一条, -1 上一条, 0 不动) -> 必要时回表 -> 拷出整行。
+// 返回 0 成功；1 已到尽头；4 二级索引条目对应的行不存在。
+//
+//export MyEngine_CursorFetch
+func MyEngine_CursorFetch(h C.ulonglong, step C.int, pkWidth C.int, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
+	c := cur(h)
+	if c == nil {
+		return rcNotFound
+	}
+	mu.RLock()
+	defer mu.RUnlock()
+	if step != 0 {
+		if rc := c.step(int(step)); rc != rcOK {
+			return C.int(rc)
+		}
+	}
+	row, rc := c.fetchRow(int(pkWidth))
+	if rc != rcOK {
+		return C.int(rc)
+	}
+	return copyOut(row, out, capacity, outlen)
+}
+
+// CursorSeekFetch = CursorSeek + 取整行，同样只跨一次语言边界。
+//
+//export MyEngine_CursorSeekFetch
+func MyEngine_CursorSeekFetch(h C.ulonglong, key unsafe.Pointer, klen C.size_t, mode C.int, pkWidth C.int, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
+	c := cur(h)
+	if c == nil {
+		return rcNotFound
+	}
+	mu.RLock()
+	defer mu.RUnlock()
+	if rc := c.seek(bytesOf(key, klen), int(mode)); rc != rcOK {
+		return C.int(rc)
+	}
+	row, rc := c.fetchRow(int(pkWidth))
+	if rc != rcOK {
+		return C.int(rc)
+	}
+	return copyOut(row, out, capacity, outlen)
+}
+
 //export MyEngine_CursorKey
 func MyEngine_CursorKey(h C.ulonglong, out unsafe.Pointer, capacity C.size_t, outlen *C.size_t) C.int {
 	c := cur(h)
@@ -219,6 +263,28 @@ func MyEngine_CursorVal(h C.ulonglong, out unsafe.Pointer, capacity C.size_t, ou
 		return rcNotFound
 	}
 	return copyOut(c.val, out, capacity, outlen)
+}
+
+// 性能剖析：设置 MYENGINE_CPUPROFILE=/path/cpu.prof 后，Go 库加载时开始采样；
+// 调用 MyEngine_ProfileStop() 写出文件（c-shared 库没有退出钩子，需显式停止）。
+var profFile *os.File
+
+func init() {
+	if p := os.Getenv("MYENGINE_CPUPROFILE"); p != "" {
+		if f, err := os.Create(p); err == nil {
+			profFile = f
+			pprof.StartCPUProfile(f)
+		}
+	}
+}
+
+//export MyEngine_ProfileStop
+func MyEngine_ProfileStop() {
+	if profFile != nil {
+		pprof.StopCPUProfile()
+		profFile.Close()
+		profFile = nil
+	}
 }
 
 func main() {}

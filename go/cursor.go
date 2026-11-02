@@ -6,10 +6,11 @@ import "bytes"
 
 // 返回码约定：0 成功；1 未找到/失败；2 主键重复；3 缓冲区不足。
 const (
-	rcOK       = 0
-	rcNotFound = 1
-	rcDup      = 2
-	rcTooSmall = 3
+	rcOK         = 0
+	rcNotFound   = 1
+	rcDup        = 2
+	rcTooSmall   = 3
+	rcRowMissing = 4 // 二级索引条目存在，但主索引里找不到对应的行
 )
 
 // Seek 模式（与 ha_myengine.cc 中的 SEEK_* 一致）。
@@ -143,4 +144,22 @@ func (c *cursor) step(dir int) int {
 		return c.set(t, t.UpperBound(c.key))
 	}
 	return c.set(t, t.LastLess(c.key))
+}
+
+// fetchRow 返回游标当前位置对应的整行：主索引直接取 val；二级索引用 key 末尾的主键回表。
+func (c *cursor) fetchRow(pkWidth int) ([]byte, int) {
+	if !c.valid {
+		return nil, rcNotFound
+	}
+	if c.idx == 0 {
+		return c.val, rcOK
+	}
+	if len(c.key) < pkWidth {
+		return nil, rcRowMissing
+	}
+	v, ok := c.tbl.treeRO(0).Get(c.key[len(c.key)-pkWidth:])
+	if !ok {
+		return nil, rcRowMissing
+	}
+	return v, rcOK
 }

@@ -32,7 +32,7 @@ class ha_myengine : public handler {
   void compute_widths();
   void close_cursor();
   void open_cursor(uint idx);
-  int fetch_current(uchar *buf, uint idx);
+  int seek_fetch(uchar *buf, const void *key, size_t klen, int mode);
   int step(uchar *buf, int dir);
   int insert_index_entries(const uchar *rec, const std::string &pk);
   void delete_index_entries(const uchar *rec, const std::string &pk);

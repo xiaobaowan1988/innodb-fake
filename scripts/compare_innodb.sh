@@ -11,6 +11,12 @@ for eng in InnoDB MyEngine; do
   run -e "DROP DATABASE IF EXISTS $db; CREATE DATABASE $db" >/dev/null
   sed "s/__ENGINE__/$eng/g" "$ROOT/compare.sql" | run "$db" > "$OUT/$eng.txt"
 done
+# 防止"两边都连不上服务、输出相同"被误判为通过
+for eng in InnoDB MyEngine; do
+  if grep -qE "ERROR 20(02|03|13)" "$OUT/$eng.txt" || [ "$(wc -l < "$OUT/$eng.txt")" -lt 100 ]; then
+    echo "FAIL: $eng output looks invalid (connection error or too short):"; head -5 "$OUT/$eng.txt"; exit 2
+  fi
+done
 if diff -u "$OUT/InnoDB.txt" "$OUT/MyEngine.txt" > "$OUT/diff.txt"; then
   echo "PASS: $(grep -c '^+--' "$OUT/InnoDB.txt" 2>/dev/null) result sets identical ($(wc -l < "$OUT/InnoDB.txt") lines)"
 else

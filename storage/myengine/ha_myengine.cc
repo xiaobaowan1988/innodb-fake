@@ -18,7 +18,7 @@ static const bool g_trace = getenv("MYENGINE_QUIET") == nullptr;
   do { if (g_trace) fprintf(stderr, "[myengine] %s " fmt "\n", __func__, ##__VA_ARGS__); } while (0)
 
 // Go 端返回码
-enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3 };
+enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_ROW_MISSING = 4 };
 // Go 端 seek 模式
 enum { SEEK_EXACT = 0, SEEK_GE = 1, SEEK_AFTER = 2, SEEK_LE = 3, SEEK_LT = 4,
        SEEK_FIRST = 5, SEEK_LAST = 6, SEEK_PREFIX_LAST = 7 };
@@ -270,27 +270,23 @@ void ha_myengine::open_cursor(uint idx) {
   cur = MyEngine_CursorOpen(const_cast<char *>(tbl_name.c_str()), idx);
 }
 
-// 把游标当前条目装入 buf。二级索引需要用主键回表。
-int ha_myengine::fetch_current(uchar *buf, uint idx) {
-  size_t len = 0;
-  if (idx == 0) {
-    int rc = MyEngine_CursorVal(cur, buf, table->s->reclength, &len);
-    return rc == RC_OK ? 0 : HA_ERR_END_OF_FILE;
-  }
-  std::string k(512 + pk_width + 64, '\0');
-  size_t klen = 0;
-  if (MyEngine_CursorKey(cur, &k[0], k.size(), &klen) != RC_OK || klen < pk_width) return HA_ERR_END_OF_FILE;
-  int rc = MyEngine_Get(const_cast<char *>(tbl_name.c_str()), 0, &k[klen - pk_width], pk_width, buf,
-                        table->s->reclength, &len);
-  return rc == RC_OK ? 0 : HA_ERR_KEY_NOT_FOUND;
+// Go 端合并接口的返回码 -> handler 错误码。
+static inline int fetch_rc(int rc) {
+  if (rc == RC_OK) return 0;
+  return rc == RC_ROW_MISSING ? HA_ERR_KEY_NOT_FOUND : HA_ERR_END_OF_FILE;
 }
 
+// 每行只跨一次语言边界：Go 端完成 移动游标 + (二级索引)回表 + 拷出整行。
 int ha_myengine::step(uchar *buf, int dir) {
-  if (!cur || MyEngine_CursorStep(cur, dir) != RC_OK) {
-    return HA_ERR_END_OF_FILE;
-  }
-  int e = fetch_current(buf, active_index);
-  return e;
+  if (!cur) return HA_ERR_END_OF_FILE;
+  size_t len = 0;
+  return fetch_rc(MyEngine_CursorFetch(cur, dir, pk_width, buf, table->s->reclength, &len));
+}
+
+int ha_myengine::seek_fetch(uchar *buf, const void *key, size_t klen, int mode) {
+  size_t len = 0;
+  return fetch_rc(MyEngine_CursorSeekFetch(cur, const_cast<void *>(key), klen, mode, pk_width, buf,
+                                           table->s->reclength, &len));
 }
 
 int ha_myengine::rnd_init(bool scan) {
@@ -307,18 +303,10 @@ int ha_myengine::rnd_end() {
 }
 
 int ha_myengine::rnd_next(uchar *buf) {
-  int rc;
-  if (!scan_started) {
-    scan_started = true;
-    rc = MyEngine_CursorSeek(cur, nullptr, 0, SEEK_FIRST);
-  } else {
-    rc = MyEngine_CursorStep(cur, 1);
-  }
-  if (rc != RC_OK) {
-    TRACE("-> HA_ERR_END_OF_FILE");
-    return HA_ERR_END_OF_FILE;
-  }
-  return fetch_current(buf, 0);
+  int e = scan_started ? step(buf, 1) : seek_fetch(buf, nullptr, 0, SEEK_FIRST);
+  scan_started = true;
+  if (e == HA_ERR_END_OF_FILE) TRACE("-> HA_ERR_END_OF_FILE");
+  return e;
 }
 
 void ha_myengine::position(const uchar *record) {
@@ -367,15 +355,11 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
   key_restore(table->record[0], key, &table->key_info[active_index], key_len);
   std::string k;
   key_for(active_index, table->record[0], nparts, k);
-  int rc = MyEngine_CursorSeek(cur, &k[0], k.size(), mode);
-  if (rc != RC_OK && find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
-    rc = MyEngine_CursorSeek(cur, &k[0], k.size(), SEEK_LE);
+  int e = seek_fetch(buf, k.data(), k.size(), mode);
+  if (e == HA_ERR_END_OF_FILE && find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
+    e = seek_fetch(buf, k.data(), k.size(), SEEK_LE);
   }
-  if (rc != RC_OK) {
-    return HA_ERR_KEY_NOT_FOUND;
-  }
-  int e = fetch_current(buf, active_index);
-  return e;
+  return e == HA_ERR_END_OF_FILE ? HA_ERR_KEY_NOT_FOUND : e;
 }
 
 int ha_myengine::index_next(uchar *buf) { TRACE(""); return step(buf, 1); }
@@ -383,20 +367,12 @@ int ha_myengine::index_prev(uchar *buf) { TRACE(""); return step(buf, -1); }
 
 int ha_myengine::index_first(uchar *buf) {
   TRACE("");
-  if (MyEngine_CursorSeek(cur, nullptr, 0, SEEK_FIRST) != RC_OK) {
-    return HA_ERR_END_OF_FILE;
-  }
-  int e = fetch_current(buf, active_index);
-  return e;
+  return seek_fetch(buf, nullptr, 0, SEEK_FIRST);
 }
 
 int ha_myengine::index_last(uchar *buf) {
   TRACE("");
-  if (MyEngine_CursorSeek(cur, nullptr, 0, SEEK_LAST) != RC_OK) {
-    return HA_ERR_END_OF_FILE;
-  }
-  int e = fetch_current(buf, active_index);
-  return e;
+  return seek_fetch(buf, nullptr, 0, SEEK_LAST);
 }
 
 // ---------------------------------------------------------------- 统计与锁

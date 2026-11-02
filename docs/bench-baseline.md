@@ -66,3 +66,48 @@ InnoDB 设置 `innodb_flush_log_at_trx_commit=2`，buffer pool 128MB（数据全
   每行多次 cgo 调用、`fetch_current` 里每行分配并清零一个 ~600 字节的 `std::string`、回表再下探一次。
   下一步应先 profile 再优化，而不是猜。
 - c=4 -> c=8 回落是因为机器只有 4 核且压测客户端也占 CPU。
+
+---
+
+# 第三轮：profile 驱动的优化 —— 每行只跨一次语言边界
+
+## Profile 方法与发现
+- `gdb` 对 mysqld 采样**不可行**（每次附加都暂停进程，吞吐被拖到 31 qps，样本多数落在空闲线程），改用：
+  - `bench/microbench.cc`：脱离 MySQL，用与 handler 相同的调用序列驱动 Go 库，逐项拆分单行成本；
+  - Go pprof：`MYENGINE_CPUPROFILE=/path/cpu.prof`，调用 `MyEngine_ProfileStop()` 写出。
+- 发现（单行二级索引扫描，微基准）：
+  - 每次 C++→Go 调用约 130~200ns；旧接口每行 3 次（`CursorStep`+`CursorKey`+`Get`）。
+  - 每次 `Get` 还要 `C.GoString(表名)` + map 查表（pprof 里的 `gostring`、`mapaccess1_faststr`）。
+  - 回表是随机访问，cache miss 明显（顺序 Get 365ns，按二级索引顺序回表约 700ns）。
+  - **每行分配 600 字节 `std::string` 几乎没有成本**（1236ns vs 1261ns，在噪声内）——此前的猜测不成立。
+
+## 改动
+新增 `MyEngine_CursorFetch` / `MyEngine_CursorSeekFetch`：Go 端一次完成 移动游标 + (二级索引)回表 + 拷出整行；
+C++ 的 `step`、`rnd_next`、`index_read_map`、`index_first/last` 全部改用，每行一次跨语言调用，一次读锁。
+
+## 微基准（每行，3 次重复）
+| 接口 | ns/行 |
+|---|---|
+| 旧：Step+Key+Get（3 次跨语言） | 1017 / 1033 / 1034 |
+| 新：Fetch（1 次跨语言） | 654 / 666 / 683 |
+
+## 端到端 QPS：基线 -> 第二轮 -> 第三轮（MyEngine）
+| 二级索引扫描 | 基线 | 第二轮 | 第三轮 | InnoDB(第三轮) |
+|---|---|---|---|---|
+| c=1 | 887 | 814 | **995** | 2648 |
+| c=2 | 942 | 1538 | **1858** | 4690 |
+| c=4 | 784 | 2594 | **3716** | 9422 |
+| c=8 | 757 | 2042 | **3060** | 9954 |
+
+与 InnoDB 的差距（c=4）：基线 14.6 倍 -> 第二轮 4.1 倍 -> 第三轮 2.5 倍。
+微基准每行省约 365ns × 500 行 ≈ 0.18ms，与端到端单线程 1.23ms -> 1.0ms 吻合。
+点查、范围扫描、插入、混合负载在噪声范围内（±10~15%，InnoDB 自身同样有波动）。
+
+## 剩余差距的原因（已验证）
+`EXPLAIN` 显示 InnoDB 对 `SELECT SUM(id) ... FORCE INDEX(k_grp)` 是 **`Using index`（覆盖索引，不回表）**，
+MyEngine 是 `NULL`（每行回表并拷贝整行）。下一步：支持覆盖索引扫描（`HA_KEYREAD_ONLY`），需要在二级索引里
+保存可还原的键值（`Field::make_sort_key` 对字符串不可逆）。另外 MyEngine 对该查询的行数估计是 10（实际 500），
+`records_in_range` 也该实现。
+
+## 测试工具的修正
+`compare_innodb.sh` 之前在 mysqld 没起来时会因"两边都是同一条连接错误"而误报 PASS；现已加守卫（连接错误或输出过短则失败）。
