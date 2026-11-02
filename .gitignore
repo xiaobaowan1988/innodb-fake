@@ -1,2 +1,3 @@
 go/libmyengine.so
 go/libmyengine.h
+__pycache__/
