@@ -252,8 +252,8 @@ func (c *Cursor) registerGap(dir int, hasCand, isFirst bool) {
 	loInf, hiInf := true, true
 	before := func() { // 候选前面的间隙 (前驱, e)
 		lo, loInf, hi, hiInf = nil, true, c.raw.key, false
-		if p := c.raw.p.Prev(); p.valid() {
-			lo, loInf = p.key(), false
+		if k, ok := c.raw.prevKey(); ok {
+			lo, loInf = k, false
 		}
 		c.t.addGap(c.ix, lo, loInf, hi, hiInf)
 	}
@@ -261,8 +261,8 @@ func (c *Cursor) registerGap(dir int, hasCand, isFirst bool) {
 		if hasCand {
 			before()
 		} else {
-			if l := t.Last(); l.valid() {
-				lo, loInf = l.key(), false
+			if k, ok := keyAt(t, locLast, nil); ok {
+				lo, loInf = k, false
 			}
 			c.t.addGap(c.ix, lo, loInf, nil, true)
 		}
@@ -272,16 +272,16 @@ func (c *Cursor) registerGap(dir int, hasCand, isFirst bool) {
 		before()
 		if isFirst { // 起点上方的间隙 (e, 后继)
 			lo, loInf, hi, hiInf = c.raw.key, false, nil, true
-			if p := c.raw.p.Next(); p.valid() {
-				hi, hiInf = p.key(), false
+			if k, ok := c.raw.nextKey(); ok {
+				hi, hiInf = k, false
 			}
 			c.t.addGap(c.ix, lo, loInf, hi, hiInf)
 		}
 		return
 	}
 	// 反向且没有候选：从索引开头越界，或者索引为空
-	if f := t.First(); f.valid() {
-		c.t.addGap(c.ix, nil, true, f.key(), false)
+	if k, ok := keyAt(t, locFirst, nil); ok {
+		c.t.addGap(c.ix, nil, true, k, false)
 	} else {
 		c.t.addGap(c.ix, nil, true, nil, true)
 	}

@@ -29,24 +29,35 @@ func seekDir(mode int) int {
 func seekNeedsPrefix(mode int) bool { return mode == seekExact || mode == seekPrefixLast }
 
 // rawCursor 只管"在一棵 B+ 树里的位置"，不关心事务和可见性。
-// 树未被修改时直接沿叶子链移动；树被修改过（version 变了）则按上次的 key 重新定位，
-// 所以扫描期间增删不会使游标失效。
+// 树未被修改（epoch 与叶子 ver 都没变）时沿叶子链 O(1) 移动；否则按上次的 key 重新下探，
+// 所以扫描期间增删不会使游标失效。所有对树的访问都由 BTree 自己加锁。
 type rawCursor struct {
 	t     *BTree
-	p     pos // 定位时的叶子位置，仅在 ver 未变时可用
-	ver   uint64
+	loc   Loc
 	key   []byte
 	val   any
 	valid bool
+
+	vk    []byte // visit 回调捕获的结果
+	vv    any
+	visit func(k []byte, v any)
 }
 
-func (c *rawCursor) set(p pos) bool {
-	if !p.valid() {
+func (c *rawCursor) capture(k []byte, v any) { c.vk, c.vv = k, v }
+
+func (c *rawCursor) visitFn() func(k []byte, v any) {
+	if c.visit == nil {
+		c.visit = c.capture
+	}
+	return c.visit
+}
+
+func (c *rawCursor) setFrom(loc Loc, ok bool) bool {
+	if !ok {
 		c.valid = false
 		return false
 	}
-	c.p, c.ver = p, c.t.version
-	c.key, c.val, c.valid = p.key(), p.val(), true
+	c.loc, c.key, c.val, c.valid = loc, c.vk, c.vv, true
 	return true
 }
 
@@ -63,37 +74,42 @@ func prefixSucc(k []byte) []byte {
 }
 
 func (c *rawCursor) seek(k []byte, mode int) bool {
-	t := c.t
+	t, v := c.t, c.visitFn()
 	switch mode {
 	case seekExact:
-		p := t.LowerBound(k)
-		return p.valid() && bytes.HasPrefix(p.key(), k) && c.set(p) || c.invalidate()
+		if c.setFrom(t.Locate(locGE, k, v)) && bytes.HasPrefix(c.key, k) {
+			return true
+		}
+		return c.invalidate()
 	case seekGE:
-		return c.set(t.LowerBound(k))
+		return c.setFrom(t.Locate(locGE, k, v))
 	case seekAfter:
 		if s := prefixSucc(k); s != nil {
-			return c.set(t.LowerBound(s))
+			return c.setFrom(t.Locate(locGE, s, v))
 		}
 		return c.invalidate()
 	case seekLE:
 		if s := prefixSucc(k); s != nil {
-			return c.set(t.LastLess(s))
+			return c.setFrom(t.Locate(locLT, s, v))
 		}
-		return c.set(t.Last())
+		return c.setFrom(t.Locate(locLast, nil, v))
 	case seekLT:
-		return c.set(t.LastLess(k))
+		return c.setFrom(t.Locate(locLT, k, v))
 	case seekFirst:
-		return c.set(t.First())
+		return c.setFrom(t.Locate(locFirst, nil, v))
 	case seekLast:
-		return c.set(t.Last())
+		return c.setFrom(t.Locate(locLast, nil, v))
 	case seekPrefixLast:
-		var p pos
+		var ok bool
 		if s := prefixSucc(k); s != nil {
-			p = t.LastLess(s)
+			ok = c.setFrom(t.Locate(locLT, s, v))
 		} else {
-			p = t.Last()
+			ok = c.setFrom(t.Locate(locLast, nil, v))
 		}
-		return p.valid() && bytes.HasPrefix(p.key(), k) && c.set(p) || c.invalidate()
+		if ok && bytes.HasPrefix(c.key, k) {
+			return true
+		}
+		return c.invalidate()
 	}
 	return c.invalidate()
 }
@@ -105,16 +121,15 @@ func (c *rawCursor) step(dir int) bool {
 	if !c.valid {
 		return false
 	}
-	t := c.t
-	if t.version == c.ver { // 快路径：树没变，沿叶子链移动，O(1)
-		if dir > 0 {
-			return c.set(c.p.Next())
-		}
-		return c.set(c.p.Prev())
-	}
-	// 慢路径：树被改过，按 key 重新下探
-	if dir > 0 {
-		return c.set(t.UpperBound(c.key))
-	}
-	return c.set(t.LastLess(c.key))
+	return c.setFrom(c.t.StepFrom(c.loc, dir, c.key, c.visitFn()))
+}
+
+// 物理邻居的键（用于登记间隙）。每次都是一次独立的下探，只在加锁范围扫描时使用。
+func (c *rawCursor) prevKey() ([]byte, bool) { return keyAt(c.t, locLT, c.key) }
+func (c *rawCursor) nextKey() ([]byte, bool) { return keyAt(c.t, locGT, c.key) }
+
+func keyAt(t *BTree, op int, key []byte) ([]byte, bool) {
+	var k []byte
+	_, ok := t.Locate(op, key, func(kk []byte, _ any) { k = kk })
+	return k, ok
 }

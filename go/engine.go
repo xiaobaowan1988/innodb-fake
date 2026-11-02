@@ -539,34 +539,35 @@ func (e *Engine) checkUnique(t *Txn, tb *table, skip [][]byte, sec []secKey) (wa
 		if !sk.unique {
 			continue
 		}
-		for p := tb.sec[sk.idx].LowerBound(sk.key); p.valid() && bytes.HasPrefix(p.key(), sk.key); p = p.Next() {
-			cpk := p.key()[len(sk.key):]
-			skipped := false
+		tb.sec[sk.idx].ScanPrefix(sk.key, func(entry []byte) bool {
+			cpk := entry[len(sk.key):]
 			for _, s := range skip {
 				if bytes.Equal(s, cpk) {
-					skipped = true
-					break
+					return true
 				}
-			}
-			if skipped {
-				continue
 			}
 			h := tb.head(cpk)
 			if h == nil {
-				continue
+				return true
 			}
 			v := h.head
 			if v.trx != t && v.trx.commitTS.Load() == 0 {
-				return cpk, nil // 另一个活跃事务改过这一行：等它结束
+				wait = cpk // 另一个活跃事务改过这一行：等它结束
+				return false
 			}
 			if v.deleted {
-				continue
+				return true
 			}
 			for _, s := range v.sec {
 				if s.idx == sk.idx && bytes.Equal(s.key, sk.key) {
-					return nil, DupError{sk.idx}
+					err = DupError{sk.idx}
+					return false
 				}
 			}
+			return true
+		})
+		if wait != nil || err != nil {
+			return wait, err
 		}
 	}
 	return nil, nil

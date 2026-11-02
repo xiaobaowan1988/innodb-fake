@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func newTree() *BTree { return NewBTree() }
+func newTree() *BTree { return newBTreeSized(4) } // 小扇出：让借位/合并/分裂频繁发生
 
 // 键 = 2 字节"前缀"部分 + 2 字节后缀，便于测试前缀匹配类模式。
 func k2(a, b int) []byte { return []byte{byte(a >> 8), byte(a), byte(b >> 8), byte(b)} }
@@ -193,4 +193,63 @@ func k2int(b []byte) uint64 {
 		v = v<<8 | uint64(x)
 	}
 	return v
+}
+
+// 游标定位之后，树发生了结构修改（分裂/借位/合并），游标的下一步必须仍然是"上一个键之后最近的存活键"。
+// 靠 epoch 和叶子 ver 让位置失效；缺了任何一个，都会在借位/合并后重复返回或跳过某个键。
+func TestCursorSurvivesStructureModifications(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	for iter := 0; iter < 30000; iter++ {
+		tb := newTree()
+		live := map[int]bool{}
+		for i := 0; i < 20+rng.Intn(30); i++ {
+			v := rng.Intn(200)
+			if !live[v] {
+				tb.Put(k(v), nil, false)
+				live[v] = true
+			}
+		}
+		keys := func() []int {
+			var r []int
+			for v := range live {
+				r = append(r, v)
+			}
+			sort.Ints(r)
+			return r
+		}
+		ks := keys()
+		c := &rawCursor{t: tb}
+		start := ks[rng.Intn(len(ks))]
+		if !c.seek(k(start), seekGE) {
+			t.Fatal("seek")
+		}
+		cur := kint(c.key)
+		for m := 1 + rng.Intn(6); m > 0; m-- { // 对树做若干次随机修改
+			v := rng.Intn(200)
+			if live[v] && rng.Intn(2) == 0 {
+				tb.Delete(k(v))
+				delete(live, v)
+			} else if !live[v] {
+				tb.Put(k(v), nil, false)
+				live[v] = true
+			}
+		}
+		dir := 1
+		if rng.Intn(2) == 0 {
+			dir = -1
+		}
+		want, wantOK := 0, false
+		for _, v := range keys() {
+			if dir > 0 && v > cur && (!wantOK || v < want) {
+				want, wantOK = v, true
+			}
+			if dir < 0 && v < cur && (!wantOK || v > want) {
+				want, wantOK = v, true
+			}
+		}
+		ok := c.step(dir)
+		if ok != wantOK || (ok && kint(c.key) != want) {
+			t.Fatalf("iter %d: from %d dir %d: got (%v, %d) want (%v, %d)", iter, cur, dir, ok, kint(c.key), wantOK, want)
+		}
+	}
 }

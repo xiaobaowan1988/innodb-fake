@@ -38,6 +38,8 @@ def worker(args):
             cur.execute(f"SELECT SUM(id) FROM {t} FORCE INDEX(k_grp) WHERE grp=%s", (rnd.randint(0, 99),)); cur.fetchall()
         elif wl == "insert":
             next_id += 1; cur.execute(f"INSERT INTO {t} VALUES (%s,%s,'x')", (next_id, next_id % 100))
+        elif wl == "update":  # 更新随机的不同行：逻辑上互不冲突，考验物理并发
+            cur.execute(f"UPDATE {t} SET pad=%s WHERE id=%s", ('u%d' % rnd.randint(0, 9), rnd.randint(1, n)))
         elif wl == "mixed":  # 90% 点查 + 10% 更新
             if rnd.random() < 0.9:
                 cur.execute(f"SELECT * FROM {t} WHERE id=%s", (rnd.randint(1, n),)); cur.fetchall()

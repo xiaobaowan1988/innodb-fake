@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -136,7 +135,9 @@ func TestRollbackAndStmtRollbackAndSavepoint(t *testing.T) {
 	}
 	// 二级索引也被清干净：回滚插入的行不应在二级索引里留下条目
 	for _, id := range []int{3, 4, 5} {
-		if tb.sec[1].LowerBound(pk4(id*10)).valid() && bytes.HasPrefix(tb.sec[1].LowerBound(pk4(id*10)).key(), pk4(id*10)) {
+		n := 0
+		tb.sec[1].ScanPrefix(pk4(id*10), func([]byte) bool { n++; return true })
+		if n != 0 {
 			t.Fatalf("stale secondary entry for rolled back row %d", id)
 		}
 	}
