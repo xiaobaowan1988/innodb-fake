@@ -156,7 +156,7 @@ type ReadView struct{ snapTS uint64; me *Txn }
 - [x] **P1 纯 Go 核心**：`engine.go` + 单测通过（含 `-race`）。12 个测试；另做了 6 个变异检查（可见性恒真、二级索引不核对、死锁检测失效、不取加锁读、回滚不弹版本、purge 过度）均被测试抓到。
 - [x] **P2 接入 MySQL**：cgo 层与 C++ handler 改造；`compare_innodb.sh` 仍 147 个结果集一致；`concurrency_check.py` 四项异常数均为 0（UNIQUE 加压到 2000 值×8 客户端，连续 2 次 0 重复；此前每轮都重复）。
 - [x] **P3 场景验证**：`txn_check.py` 21 个场景（含锁等待超时，需 `MYENGINE_LOCK_WAIT_SECS=2` 与 `--timeout-tests`）全部与 InnoDB 一致；`concurrency_check.py` 四项异常数均为 0；`compare_innodb.sh` 147 个结果集一致；`go test -race` 通过。
-- [ ] **P4 收尾**：性能重测、文档更新、限制清单。
+- [x] **P4 收尾**：性能重测（`docs/bench-baseline.md` 第四轮）、文档更新（`docs/concurrency-issues.md`、README）、限制清单。
 
 ## 7. 风险
 - **binlog 与事务引擎的交互**：默认开启 binlog，引擎变成事务引擎后会走 binlog 的事务缓存；若出现问题，用 `--skip-log-bin` 运行测试并记录。
@@ -200,3 +200,10 @@ type ReadView struct{ snapTS uint64; me *Txn }
   2. **`txn_check.py` 的死锁场景不比较"谁是牺牲者"**：InnoDB 与本引擎的挑选规则不同，只检查"恰好一个 1213，另一个成功"。
   3. **已用实验确认"无间隙锁"的限制**：A 在 `BEGIN` 后对 `id >= 2` 做 `SELECT … FOR UPDATE`，B 往该范围插入——
      InnoDB 阻塞 B（间隙锁），本引擎不阻塞，A 再次 `FOR UPDATE` 读到 3 行（幻读）。这是计划里的非目标，写入文档。
+- v5（P4 完成时）：
+  1. **性能预期被修正**：初稿预期"点查略慢、写更慢"。实测读路径基本持平；写慢 76% 的主要原因是 **binlog 的 fsync**
+     （事务引擎的自动提交要走 binlog 提交），不是 MVCC 本身——`sync_binlog=0` 时插入回到 4893 qps。
+  2. **风险项"binlog 与事务引擎的交互"实际结果**：没有出现错误或警告，只是带来上述性能代价。
+  3. **二级索引条目"只增不减"的风险**：purge 通过版本链的清理同步删除不再被引用的条目；单元测试验证清理后条目数正确。
+     端到端的长期性能影响未单独量化。
+  4. 遗留项见 `docs/concurrency-issues.md`；未做的优化：二级索引扫描的可见性开销 profile、物理层更细粒度的并发。
