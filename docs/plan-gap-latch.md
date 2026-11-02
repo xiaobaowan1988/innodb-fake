@@ -225,3 +225,19 @@ e.tmu、dmu、pmu 都是叶子锁，内部不再取别的锁
      单个 purge 协程、`gapMu` 的读锁缓存行、GC。需要再 profile。
   6. **新增调试开关** `MYENGINE_CPUPROFILE_SECS=N`：配合 `MYENGINE_CPUPROFILE` 让库在 N 秒后自动停止并写出 profile
      （mysqld 没有机会调用 `MyEngine_ProfileStop`）。但 pprof 对 c-shared 库解析不出 Go 函数名，SQL 层的 profile 实际没派上用场。
+- v7（并发逻辑审计：用户问"现在的并发逻辑是不是有问题，先不考虑速度"）：
+  **方法**：不靠推理下结论，把可疑点逐个做成和 InnoDB 的对照实验。实测**没有问题**的：S→X 升级死锁（恰好一个 1213）、
+  8 个客户端并发 `INSERT … ON DUPLICATE KEY UPDATE` 计数（3200/3200）、并发修改主键（主索引/二级索引行数一致且无重复）、
+  同事务内 DELETE 再 INSERT 同一键 + 快照读者（任何快照里行数恒定）、并发负载结束后没有任何残留的行锁/间隙锁。
+  **发现两个真实问题**：
+  1. **语句起点被重复重设**。显式事务里 `INSERT (20),(21),(1)`（最后一行重复）失败：InnoDB 整条语句撤销，
+     本引擎残留 `main=[1,20,21]`、`audit=[1,20]`（AFTER INSERT 触发器写入 audit 表）。
+     修法：语句起点只在"这条语句的第一个表被打开时"设置一次；用 MySQL 的语句结束钩子（`hton->commit/rollback` 的 `all=false`，
+     每条语句结束都会被调用）清除"语句进行中"标记。`start_stmt`（LOCK TABLES 模式）同样走这条路径。
+     不用 `external_lock(F_UNLCK)` 做计数：LOCK TABLES 模式下它不会逐语句调用，计数会泄漏，泄漏的后果是语句回滚范围过大
+     （把前面语句的修改也撤销掉）——比不修更糟。事务结束时一并清除标记。
+  2. **锁等待不可被 KILL**。`KILL QUERY` 一个被行锁阻塞的语句：InnoDB 立即返回 1317，本引擎 8 秒后仍在阻塞（只能等 50 秒超时）。
+     修法：C++ 把 `thd_killed` 的函数指针和 `thd` 交给 Go 的事务；所有等待（行锁、间隙冲突、唯一键）改成每 100ms 醒来检查一次，
+     被杀则退出并返回新的错误码 `rcKilled`；C++ 按 InnoDB 的做法 `thd_set_kill_status(thd)` 后返回 `HA_ERR_GENERIC`。
+     用 C 里的一个小跳板函数调用函数指针，避免 Go 库对 `thd_killed` 产生链接期的未定义符号。
+  **回归测试**：`scripts/txn_check.py` 增加触发器场景（成功路径、触发器内部失败、显式事务里的语句回滚）和 KILL 场景，与 InnoDB 逐行对照。
