@@ -11,7 +11,7 @@
 - 游标按 key 重新定位（`Step` = UpperBound/LastLess），扫描期间增删不会使游标失效。
 
 ## 限制
-必须有主键；不支持 BLOB/TEXT、前缀索引、降序索引、事务；全局一把锁；**仅内存，mysqld 重启后表结构还在但数据为空**。
+必须有主键；不支持 BLOB/TEXT、前缀索引、降序索引、事务；**并发语句之间没有互斥，存在丢失更新、UNIQUE 被破坏、自增重复、二级索引读到中间状态等逻辑问题，见 `docs/concurrency-issues.md`**；**仅内存，mysqld 重启后表结构还在但数据为空**。
 
 ## 使用
 1. `scripts/build_go.sh`（只改 Go：几秒）；改 C++ 后 `cd <build> && make myengine`（几秒）
