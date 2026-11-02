@@ -565,6 +565,15 @@ def entry_lock_dup_check_ignores_pk_lock_holder(c):
     c.run("B", "INSERT INTO gw VALUES (13, 1, 0)")                                     # 要等 A（收尾解除）
     c.run("A", "ROLLBACK")
 
+@scenario
+def pk_change_dup_keeps_shared_lock(c):
+    # 主键变更的 UPDATE 撞上已有主键：新主键那一行只留 S 锁，别人的重复插入（INSERT IGNORE）不被挡，删除才被挡
+    c.conn("A"); c.conn("B")
+    c.run("A", "BEGIN"); c.run("A", "UPDATE gw SET id=20 WHERE id=10")               # 20 已存在 -> 重复
+    c.run("B", "INSERT IGNORE INTO gw VALUES (20, 7, 0)")                              # 要 S：不被挡
+    c.run("B", "DELETE FROM gw WHERE id=20")                                           # 要 X：被挡（收尾解除）
+    c.run("A", "ROLLBACK")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--socket", required=True)
     ap.add_argument("--only"); ap.add_argument("--timeout-tests", action="store_true"); ap.add_argument("-v", action="store_true")

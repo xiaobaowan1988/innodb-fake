@@ -1056,7 +1056,25 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 	if err := e.lm.lock(t, tb, oldpk, lockX); err != nil {
 		return err
 	}
+	_, hadNew := t.held[lockKey{tb, 0, string(newpk)}]
 	if !same {
+		// 新主键上已有活行时 InnoDB 只留 S 锁并报重复（同 Insert）：先不加锁看一眼，取 S 后重新确认
+		liveNew := func() (l bool) {
+			tb.pri.GetFn(newpk, func(v any) {
+				if h := v.(*rowHead); h.head != nil && !h.head.deleted {
+					l = true
+				}
+			})
+			return
+		}
+		if !hadNew && liveNew() {
+			if err := e.lm.lock(t, tb, newpk, lockS); err != nil {
+				return err
+			}
+			if liveNew() {
+				return DupError{}
+			}
+		}
 		if err := e.lm.lock(t, tb, newpk, lockX); err != nil {
 			return err
 		}
@@ -1086,6 +1104,9 @@ func (e *Engine) Update(t *Txn, tb *table, oldpk, newpk, row []byte, sec []secKe
 			})
 			if newLive {
 				unlockU()
+				if !hadNew {
+					e.lm.downgrade(t, tb, newpk)
+				}
 				return DupError{}
 			}
 		}

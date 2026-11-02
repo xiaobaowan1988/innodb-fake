@@ -369,3 +369,13 @@ SQL 场景 63/63 与 InnoDB 一致（新增 `entry_lock_dup_error_only_blocks_in
 注意：fuzzer 对探测窗口（0.3s）敏感，个别 seed 在整批里有差异、单独重跑却一致（如 93、40），所以 seed 集合每次会有 ±几个的波动，不能当作确定性结论。
 **仍然存在的差异**：插入顺序类（InnoDB 先插主键）、唯一键重复错误在二级唯一索引上的间隙锁、扫描经二级索引时不锁索引条目、
 非唯一二级索引没有条目锁、死锁牺牲者选择。
+
+## v11：全 RC / 全 RR 序列 seed 100–199 的发现
+
+顺序重跑（不并行）：RR 32 个、RC 27 个问题 seed，首个差异绝大多数仍是已知的"插入顺序"类。
+需要追的是"InnoDB 不阻塞、我们阻塞"的少数几条，最小化后得到一个真问题：
+
+12. **主键变更的 UPDATE 撞上已有主键时留下 X 锁**：`UPDATE t SET id=8 WHERE id=2`（8 已存在）报 1062，
+    InnoDB 只在 8 上留 S 锁；我们先对新主键取了 X，之后别人的 `INSERT IGNORE (8,..)`（要 S）被无谓阻塞。
+    修法同 `Insert`：先不加锁看新主键是否有活行，有则取 S 并确认后报重复；否则取 X；竞态下降级。
+    验证：单元测试 `TestUpdateToExistingPkKeepsOnlySharedLock`（回退修复应失败）+ txn_check 场景 + 差分重跑 seed 196。

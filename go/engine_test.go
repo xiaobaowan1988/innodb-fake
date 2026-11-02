@@ -864,6 +864,30 @@ func TestDupInsertKeepsOnlySharedLock(t *testing.T) {
 	}
 }
 
+// 主键变更的 UPDATE 撞上已有主键：只在已存在的行上留 S 锁，别的重复插入不被阻塞。
+func TestUpdateToExistingPkKeepsOnlySharedLock(t *testing.T) {
+	e, tb := newTestEngine(t)
+	s := e.Begin(isoRepeatableRead)
+	mustInsert(t, e, s, tb, 2, 1)
+	mustInsert(t, e, s, tb, 8, 2)
+	e.Commit(s)
+	a, b := e.Begin(isoRepeatableRead), e.Begin(isoRepeatableRead)
+	if err := e.Update(a, tb, pk4(2), pk4(8), row8(5), secs(5, false)); err == nil {
+		t.Fatal("want dup")
+	}
+	res := make(chan error, 1)
+	go func() { res <- e.Insert(b, tb, pk4(8), row8(6), secs(6, false)) }()
+	select {
+	case err := <-res:
+		var d DupError
+		if !errors.As(err, &d) {
+			t.Fatalf("b must get dup, got %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("dup insert blocked by an X lock left by failed pk-changing update")
+	}
+}
+
 // RC 下加锁扫描遇到不匹配的行，UnlockLast 放掉它；RR 下不放。
 func TestUnlockLastOnlyUnderReadCommitted(t *testing.T) {
 	for _, iso := range []int{isoReadCommitted, isoRepeatableRead} {
