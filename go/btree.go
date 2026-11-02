@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 )
 
@@ -43,10 +44,36 @@ func (n *node) leafIndex(key []byte) int {
 
 func (t *BTree) findLeaf(key []byte) *node {
 	n := t.root
-	for !n.leaf {
+	for depth := 0; ; depth++ {
+		if verbose { // 调试：打印从根到叶子每一层的选择（MYENGINE_VERBOSE=1）
+			traceLevel(depth, n, key)
+		}
+		if n.leaf {
+			return n
+		}
 		n = n.children[n.childIndex(key)]
 	}
-	return n
+}
+
+func traceLevel(depth int, n *node, key []byte) {
+	if n.leaf {
+		i := n.leafIndex(key)
+		logf("  层%d 叶子   : %d 个键 [%x .. %x]，二分到第 %d 个位置", depth, len(n.keys), n.keys[0], n.keys[len(n.keys)-1], i)
+		return
+	}
+	i := n.childIndex(key)
+	logf("  层%d 内部节点: %d 个分隔键，%d 个孩子，二分选第 %d 个孩子 (分隔键 [%s .. %s])",
+		depth, len(n.keys), len(n.children), i, sepHex(n.keys, i-1), sepHex(n.keys, i))
+}
+
+func sepHex(keys [][]byte, i int) string {
+	if i < 0 {
+		return "-∞"
+	}
+	if i >= len(keys) {
+		return "+∞"
+	}
+	return fmt.Sprintf("%x", keys[i])
 }
 
 func (t *BTree) Get(key []byte) ([]byte, bool) {

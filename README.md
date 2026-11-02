@@ -17,7 +17,7 @@
 1. `scripts/build_go.sh`（只改 Go：几秒）；改 C++ 后 `cd <build> && make myengine`（几秒）
 2. `scripts/restart.sh`
 3. `scripts/compare_innodb.sh <mysql客户端> <socket>`：147 个结果集与 InnoDB 逐字一致即 PASS
-4. `MYENGINE_QUIET=1` 关闭 C++ 调用轨迹，`MYENGINE_VERBOSE=1` 打开 Go 日志
+4. `MYENGINE_QUIET=1` 关闭 C++ 调用轨迹，`MYENGINE_VERBOSE=1` 打开 Go 日志（含 B+ 树每次查找从根到叶的逐层选择）
 
 ## 构建环境（已在 MySQL 8.0.40 上验证）
 `/opt/mysrc/mysql-8.0.40/storage/myengine` 软链到本仓库 `storage/myengine`；cmake 需 `-DWITH_BOOST=<src>/boost -DDOWNLOAD_BOOST=0`；依赖 `libtirpc-dev`。
