@@ -85,6 +85,7 @@ class ha_myengine : public handler {
   int index_end() override;
   int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
                      enum ha_rkey_function find_flag) override;
+  int index_read_last_map(uchar *buf, const uchar *key, key_part_map keypart_map) override;
   int index_next(uchar *buf) override;
   int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;

@@ -421,7 +421,10 @@ void ha_myengine::apply_end_bound(int dir) {
               !key_has_null(active_index, key_scratch.data()))
                  ? 1
                  : 0;
-  MyEngine_CursorBound(cur, dir > 0 ? 2 : 3, k.data(), k.size(), end_range->flag == HA_READ_AFTER_KEY ? 1 : 0, uniq);
+  // 端点相等时是否算在范围内——与 handler::compare_key_icp 一致：key_compare_result_on_equal 对 BEFORE_KEY 为 +1(范围外)、
+  // 对 AFTER_KEY 为 -1(范围内)、其它为 0(范围内)，反向扫描时再取反。所以正向：flag != BEFORE_KEY 算包含；反向：flag != AFTER_KEY 算包含。
+  int incl = dir > 0 ? (end_range->flag != HA_READ_BEFORE_KEY) : (end_range->flag != HA_READ_AFTER_KEY);
+  MyEngine_CursorBound(cur, dir > 0 ? 2 : 3, k.data(), k.size(), incl, uniq);
 }
 
 int ha_myengine::rnd_init(bool scan) {
@@ -479,8 +482,10 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
     case HA_READ_AFTER_KEY: mode = SEEK_AFTER; break;
     case HA_READ_KEY_OR_PREV: mode = SEEK_LE; break;
     case HA_READ_BEFORE_KEY: mode = SEEK_LT; break;
-    case HA_READ_PREFIX_LAST:
-    case HA_READ_PREFIX_LAST_OR_PREV: mode = SEEK_PREFIX_LAST; break;
+    // PREFIX_LAST：这个键（前缀）的最后一行，之后沿同键往回走；PREFIX_LAST_OR_PREV：<= 该键的最后一行，
+    // 是反向范围扫描的起点，之后要越过这个键继续往回走——所以不能带同键前缀边界，映射成 LE。
+    case HA_READ_PREFIX_LAST: mode = SEEK_PREFIX_LAST; break;
+    case HA_READ_PREFIX_LAST_OR_PREV: mode = SEEK_LE; break;
     default: return HA_ERR_UNSUPPORTED;
   }
   apply_end_bound(mode == SEEK_LE || mode == SEEK_LT || mode == SEEK_PREFIX_LAST ? -1 : 1);  // 先于定位：首个候选也可能已经越过范围终点
@@ -501,10 +506,13 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
                   ? 1
                   : 0;
   int e = seek_fetch(buf, k.data(), k.size(), mode, flags);
-  if (e == HA_ERR_END_OF_FILE && find_flag == HA_READ_PREFIX_LAST_OR_PREV) {
-    e = seek_fetch(buf, k.data(), k.size(), SEEK_LE);
-  }
   return e == HA_ERR_END_OF_FILE ? HA_ERR_KEY_NOT_FOUND : e;
+}
+
+// 读取与给定键（前缀）匹配的最后一行（ORDER BY ... DESC 的 ref 访问、MAX() 优化会用到），之后用 index_prev 往回走。
+int ha_myengine::index_read_last_map(uchar *buf, const uchar *key, key_part_map keypart_map) {
+  TRACE("keypart_map=%lu", (unsigned long)keypart_map);
+  return index_read_map(buf, key, keypart_map, HA_READ_PREFIX_LAST);
 }
 
 int ha_myengine::index_next(uchar *buf) { TRACE(""); return step(buf, 1); }
