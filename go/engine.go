@@ -817,16 +817,30 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir int) ([]byte, error)
 
 // ---------------------------------------------------------------- 自增
 
-// AutoNext 预留 n 个自增值，返回第一个。需要先 AutoInit。
-func (tb *table) AutoNext(n uint64) (first uint64, ok bool) {
+// AutoReserve 预留 n 个自增值（值之间相差 increment，起点对齐到 offset），返回第一个值。
+// 计数器还没初始化时返回 ok=false，调用者应先 AutoInit。
+func (tb *table) AutoReserve(offset, increment, n uint64) (first uint64, ok bool) {
 	tb.amu.Lock()
 	defer tb.amu.Unlock()
 	if !tb.autoInit {
 		return 0, false
 	}
-	first = tb.auto + 1
-	tb.auto += n
-	return first, true
+	if increment == 0 {
+		increment = 1
+	}
+	next := tb.auto + 1
+	if increment > 1 || offset > 1 {
+		if next < offset {
+			next = offset
+		} else {
+			next = offset + ((next-offset+increment-1)/increment)*increment
+		}
+	}
+	if n == 0 {
+		n = 1
+	}
+	tb.auto = next + (n-1)*increment
+	return next, true
 }
 
 func (tb *table) AutoInit(max uint64) {
@@ -936,4 +950,17 @@ func (e *Engine) StartPurger(interval time.Duration) (stop func()) {
 		}
 	}()
 	return func() { close(done) }
+}
+
+// LastLatest 返回索引 idx 上最大键对应的、最新且未删除的行（不管事务可见性）。
+func (e *Engine) LastLatest(tb *table, idx, pkWidth int) ([]byte, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	c := &Cursor{e: e, tbl: tb, idx: idx, pkWidth: pkWidth, raw: rawCursor{t: tb.tree(idx)}}
+	for ok := c.raw.seek(nil, seekLast); ok; ok = c.raw.step(-1) {
+		if row, ok2 := c.currentRow(c.pk()); ok2 {
+			return row, true
+		}
+	}
+	return nil, false
 }

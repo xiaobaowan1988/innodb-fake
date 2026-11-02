@@ -1,5 +1,6 @@
 #include "storage/myengine/ha_myengine.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,19 +10,82 @@
 #include "mysqld_error.h"
 #include "sql/field.h"
 #include "sql/key.h"
+#include "sql/query_options.h"
 #include "sql/table.h"
 #include "libmyengine.h"  // cgo 生成的头文件
 
-// 默认打印调用轨迹；设置 MYENGINE_QUIET=1 可关闭。Go 端日志用 MYENGINE_VERBOSE=1 打开。
-static const bool g_trace = getenv("MYENGINE_QUIET") == nullptr;
+// 默认不打印调用轨迹；设置 MYENGINE_TRACE=1 打开。Go 端日志用 MYENGINE_VERBOSE=1 打开。
+static const bool g_trace = getenv("MYENGINE_TRACE") != nullptr;
 #define TRACE(fmt, ...) \
   do { if (g_trace) fprintf(stderr, "[myengine] %s " fmt "\n", __func__, ##__VA_ARGS__); } while (0)
 
 // Go 端返回码
-enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_ROW_MISSING = 4 };
+enum { RC_OK = 0, RC_NOT_FOUND = 1, RC_DUP = 2, RC_TOO_SMALL = 3, RC_DEADLOCK = 5, RC_TIMEOUT = 6 };
+// 行锁模式
+enum { LOCK_NONE = 0, LOCK_S = 1, LOCK_X = 2 };
 // Go 端 seek 模式
 enum { SEEK_EXACT = 0, SEEK_GE = 1, SEEK_AFTER = 2, SEEK_LE = 3, SEEK_LT = 4,
        SEEK_FIRST = 5, SEEK_LAST = 6, SEEK_PREFIX_LAST = 7 };
+
+static handlerton *myengine_hton = nullptr;
+
+static inline unsigned long long trx_of(THD *thd) {
+  return (unsigned long long)(uintptr_t)thd_get_ha_data(thd, myengine_hton);
+}
+static inline void set_trx(THD *thd, unsigned long long h) {
+  thd_set_ha_data(thd, myengine_hton, (void *)(uintptr_t)h);
+}
+static inline bool in_multi_stmt_txn(THD *thd) {
+  return thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN) != 0;
+}
+
+// ---------------------------------------------------------------- 事务钩子
+
+static int myengine_commit(handlerton *, THD *thd, bool all) {
+  unsigned long long h = trx_of(thd);
+  if (!h) return 0;
+  if (all || !in_multi_stmt_txn(thd)) {  // 事务结束（显式 COMMIT 或 autocommit 的语句结束）
+    TRACE("commit all=%d", (int)all);
+    MyEngine_TxnEnd(h, 1);
+    set_trx(thd, 0);
+  }
+  return 0;
+}
+
+static int myengine_rollback(handlerton *, THD *thd, bool all) {
+  unsigned long long h = trx_of(thd);
+  if (!h) return 0;
+  if (all || !in_multi_stmt_txn(thd)) {
+    TRACE("rollback all=%d", (int)all);
+    MyEngine_TxnEnd(h, 0);
+    set_trx(thd, 0);
+  } else {
+    TRACE("rollback statement");
+    MyEngine_TxnRollbackStmt(h);  // 多语句事务里只撤销当前语句
+  }
+  return 0;
+}
+
+static int myengine_close_connection(handlerton *, THD *thd) {
+  unsigned long long h = trx_of(thd);
+  if (h) {
+    MyEngine_TxnEnd(h, 0);
+    set_trx(thd, 0);
+  }
+  return 0;
+}
+
+static int myengine_savepoint_set(handlerton *, THD *thd, void *sv) {
+  unsigned long long h = trx_of(thd);
+  *(unsigned long long *)sv = h ? MyEngine_TxnSavepoint(h) : 0;
+  return 0;
+}
+static int myengine_savepoint_rollback(handlerton *, THD *thd, void *sv) {
+  unsigned long long h = trx_of(thd);
+  if (h) MyEngine_TxnRollbackTo(h, *(unsigned long long *)sv);
+  return 0;
+}
+static int myengine_savepoint_release(handlerton *, THD *, void *) { return 0; }
 
 static handler *myengine_create_handler(handlerton *hton, TABLE_SHARE *table, bool, MEM_ROOT *mem_root) {
   return new (mem_root) ha_myengine(hton, table);
@@ -29,10 +93,17 @@ static handler *myengine_create_handler(handlerton *hton, TABLE_SHARE *table, bo
 
 static int myengine_init(void *p) {
   handlerton *hton = static_cast<handlerton *>(p);
+  myengine_hton = hton;
   hton->state = SHOW_OPTION_YES;
   hton->create = myengine_create_handler;
   hton->flags = HTON_CAN_RECREATE;
-  TRACE("plugin loaded");
+  hton->commit = myengine_commit;
+  hton->rollback = myengine_rollback;
+  hton->close_connection = myengine_close_connection;
+  hton->savepoint_offset = sizeof(unsigned long long);
+  hton->savepoint_set = myengine_savepoint_set;
+  hton->savepoint_rollback = myengine_savepoint_rollback;
+  hton->savepoint_release = myengine_savepoint_release;
   return 0;
 }
 
@@ -91,6 +162,34 @@ void ha_myengine::key_for(uint idx, const uchar *rec, uint nparts, std::string &
   }
 }
 
+bool ha_myengine::key_has_null(uint idx, const uchar *rec) const {
+  KEY *ki = &table->key_info[idx];
+  ptrdiff_t diff = rec - table->record[0];
+  for (uint p = 0; p < ki->user_defined_key_parts; p++) {
+    Field *f = ki->key_part[p].field;
+    f->move_field_offset(diff);
+    bool null = f->is_nullable() && f->is_real_null();
+    f->move_field_offset(-diff);
+    if (null) return true;
+  }
+  return false;
+}
+
+// 打包所有二级索引的键：重复 [idx u32][flags u32 (bit0=唯一且不含 NULL)][len u32][key]
+void ha_myengine::pack_sec(const uchar *rec, std::string &out) const {
+  out.clear();
+  for (uint i = 1; i < table->s->keys; i++) {
+    KEY *ki = &table->key_info[i];
+    std::string k;
+    key_for(i, rec, ki->user_defined_key_parts, k);
+    uint32_t idx = i, flags = ((ki->flags & HA_NOSAME) && !key_has_null(i, rec)) ? 1 : 0, len = (uint32_t)k.size();
+    out.append((const char *)&idx, 4);
+    out.append((const char *)&flags, 4);
+    out.append((const char *)&len, 4);
+    out.append(k);
+  }
+}
+
 // ---------------------------------------------------------------- 生命周期
 
 int ha_myengine::create(const char *name, TABLE *form, HA_CREATE_INFO *, dd::Table *) {
@@ -107,7 +206,7 @@ int ha_myengine::create(const char *name, TABLE *form, HA_CREATE_INFO *, dd::Tab
     KEY *ki = &form->key_info[i];
     for (uint p = 0; p < ki->user_defined_key_parts; p++) {
       KEY_PART_INFO *kp = &ki->key_part[p];
-      if ((kp->key_part_flag & HA_PART_KEY_SEG)) {
+      if (kp->key_part_flag & HA_PART_KEY_SEG) {
         my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0), "MyEngine", "prefix index");
         return HA_WRONG_CREATE_OPTION;
       }
@@ -117,7 +216,7 @@ int ha_myengine::create(const char *name, TABLE *form, HA_CREATE_INFO *, dd::Tab
       }
     }
   }
-  return MyEngine_Create(const_cast<char *>(name));
+  return MyEngine_Create(const_cast<char *>(name), form->s->keys);
 }
 
 int ha_myengine::open(const char *name, int, uint, const dd::Table *) {
@@ -127,12 +226,15 @@ int ha_myengine::open(const char *name, int, uint, const dd::Table *) {
   thr_lock_data_init(&lock, &lock_data, nullptr);
   compute_widths();
   ref_length = pk_width;
-  return MyEngine_Open(const_cast<char *>(name));
+  tbl_h = MyEngine_TableOpen(const_cast<char *>(name), table->s->keys);
+  return 0;
 }
 
 int ha_myengine::close() {
   TRACE("");
   close_cursor();
+  MyEngine_TableClose(tbl_h);
+  tbl_h = 0;
   thr_lock_delete(&lock);
   return 0;
 }
@@ -147,46 +249,49 @@ int ha_myengine::rename_table(const char *from, const char *to, const dd::Table 
   return MyEngine_Rename(const_cast<char *>(from), const_cast<char *>(to));
 }
 
+// ---------------------------------------------------------------- 错误码映射
+
+int ha_myengine::map_rc(int rc, int not_found_code) {
+  switch (rc) {
+    case RC_OK: return 0;
+    case RC_DEADLOCK:
+      thd_mark_transaction_to_rollback(ha_thd(), 1);  // 与 InnoDB 一致：死锁时整个事务回滚
+      return HA_ERR_LOCK_DEADLOCK;
+    case RC_TIMEOUT: return HA_ERR_LOCK_WAIT_TIMEOUT;
+    default: return not_found_code;
+  }
+}
+
 // ---------------------------------------------------------------- 写路径
 
-static inline int rc_to_ha(int rc) { return rc == RC_OK ? 0 : HA_ERR_INTERNAL_ERROR; }
-
-// 二级 UNIQUE 索引冲突检查（含 NULL 的键允许重复）
-bool ha_myengine::unique_conflict(uint idx, const uchar *rec) {
-  KEY *ki = &table->key_info[idx];
-  for (uint p = 0; p < ki->user_defined_key_parts; p++) {
-    Field *f = ki->key_part[p].field;
-    ptrdiff_t diff = rec - table->record[0];
+void ha_myengine::init_auto_inc() {
+  ulonglong max = 0;
+  std::vector<uchar> buf(table->s->reclength);
+  size_t len = 0;
+  uint ni = table->s->next_number_index;
+  if (MyEngine_IndexLastLatest(tbl_h, ni, pk_width, buf.data(), buf.size(), &len) == RC_OK) {
+    Field *f = table->found_next_number_field;
+    ptrdiff_t diff = buf.data() - table->record[0];
     f->move_field_offset(diff);
-    bool null = f->is_nullable() && f->is_real_null();
+    longlong v = f->val_int();
     f->move_field_offset(-diff);
-    if (null) return false;
+    max = (f->is_unsigned() || v > 0) ? (ulonglong)v : 0;
   }
-  std::string k;
-  key_for(idx, rec, ki->user_defined_key_parts, k);
-  unsigned long long c = MyEngine_CursorOpen(const_cast<char *>(tbl_name.c_str()), idx);
-  bool hit = MyEngine_CursorSeek(c, &k[0], k.size(), SEEK_EXACT) == RC_OK;
-  MyEngine_CursorClose(c);
-  return hit;
+  MyEngine_AutoInit(tbl_h, max);
 }
 
-int ha_myengine::insert_index_entries(const uchar *rec, const std::string &pk) {
-  for (uint i = 1; i < table->s->keys; i++) {
-    std::string k;
-    key_for(i, rec, table->key_info[i].user_defined_key_parts, k);
-    k += pk;
-    MyEngine_Put(const_cast<char *>(tbl_name.c_str()), i, &k[0], k.size(), nullptr, 0, 1);
+void ha_myengine::get_auto_increment(ulonglong offset, ulonglong increment, ulonglong, ulonglong *first_value,
+                                     ulonglong *nb_reserved_values) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    unsigned long long first = 0;
+    if (MyEngine_AutoReserve(tbl_h, offset, increment, 1, &first) == 0) {
+      *first_value = first;
+      *nb_reserved_values = 1;  // 每次只预留 1 个：不产生空洞，取号本身很便宜
+      return;
+    }
+    init_auto_inc();
   }
-  return 0;
-}
-
-void ha_myengine::delete_index_entries(const uchar *rec, const std::string &pk) {
-  for (uint i = 1; i < table->s->keys; i++) {
-    std::string k;
-    key_for(i, rec, table->key_info[i].user_defined_key_parts, k);
-    k += pk;
-    MyEngine_Delete(const_cast<char *>(tbl_name.c_str()), i, &k[0], k.size());
-  }
+  *first_value = ~(ulonglong)0;  // 出错
 }
 
 int ha_myengine::write_row(uchar *buf) {
@@ -194,68 +299,45 @@ int ha_myengine::write_row(uchar *buf) {
     int e = update_auto_increment();
     if (e) return e;
   }
-  std::string pk;
+  std::string pk, sec;
   key_for(0, buf, table->key_info[0].user_defined_key_parts, pk);
+  pack_sec(buf, sec);
   TRACE("pk_len=%zu", pk.size());
-  for (uint i = 1; i < table->s->keys; i++) {
-    if ((table->key_info[i].flags & HA_NOSAME) && unique_conflict(i, buf)) {
-      last_dup_key = i;
-      return HA_ERR_FOUND_DUPP_KEY;
-    }
-  }
-  int rc = MyEngine_Put(const_cast<char *>(tbl_name.c_str()), 0, &pk[0], pk.size(), buf, table->s->reclength, 0);
+  int dup = 0;
+  int rc = MyEngine_RowInsert(txn_h, tbl_h, &pk[0], pk.size(), buf, table->s->reclength, sec.data(), sec.size(), &dup);
   if (rc == RC_DUP) {
-    last_dup_key = 0;
+    last_dup_key = dup;
     return HA_ERR_FOUND_DUPP_KEY;
   }
-  if (rc != RC_OK) return HA_ERR_INTERNAL_ERROR;
-  insert_index_entries(buf, pk);
-  return 0;
+  int e = map_rc(rc, HA_ERR_INTERNAL_ERROR);
+  if (!e && table->next_number_field) {  // 显式给出了更大的自增值：抬高计数器
+    longlong v = table->next_number_field->val_int();
+    if (table->next_number_field->is_unsigned() || v > 0) MyEngine_AutoBump(tbl_h, (ulonglong)v);
+  }
+  return e;
 }
 
 int ha_myengine::update_row(const uchar *old_data, uchar *new_data) {
-  std::string old_pk, new_pk;
+  std::string old_pk, new_pk, sec;
   key_for(0, old_data, table->key_info[0].user_defined_key_parts, old_pk);
   key_for(0, new_data, table->key_info[0].user_defined_key_parts, new_pk);
+  pack_sec(new_data, sec);
   TRACE("pk_changed=%d", (int)(old_pk != new_pk));
-  char *tn = const_cast<char *>(tbl_name.c_str());
-  // 唯一二级索引：键变化时才检查
-  for (uint i = 1; i < table->s->keys; i++) {
-    if (!(table->key_info[i].flags & HA_NOSAME)) continue;
-    std::string ok, nk;
-    key_for(i, old_data, table->key_info[i].user_defined_key_parts, ok);
-    key_for(i, new_data, table->key_info[i].user_defined_key_parts, nk);
-    if (ok != nk && unique_conflict(i, new_data)) {
-      last_dup_key = i;
-      return HA_ERR_FOUND_DUPP_KEY;
-    }
+  int dup = 0;
+  int rc = MyEngine_RowUpdate(txn_h, tbl_h, &old_pk[0], old_pk.size(), &new_pk[0], new_pk.size(), new_data,
+                              table->s->reclength, sec.data(), sec.size(), &dup);
+  if (rc == RC_DUP) {
+    last_dup_key = dup;
+    return HA_ERR_FOUND_DUPP_KEY;
   }
-  if (old_pk != new_pk) {
-    if (MyEngine_Put(tn, 0, &new_pk[0], new_pk.size(), new_data, table->s->reclength, 0) == RC_DUP) {
-      last_dup_key = 0;
-      return HA_ERR_FOUND_DUPP_KEY;
-    }
-    MyEngine_Delete(tn, 0, &old_pk[0], old_pk.size());
-  } else {
-    MyEngine_Put(tn, 0, &new_pk[0], new_pk.size(), new_data, table->s->reclength, 1);
-  }
-  delete_index_entries(old_data, old_pk);
-  insert_index_entries(new_data, new_pk);
-  return 0;
+  return map_rc(rc, HA_ERR_KEY_NOT_FOUND);
 }
 
 int ha_myengine::delete_row(const uchar *buf) {
   std::string pk;
   key_for(0, buf, table->key_info[0].user_defined_key_parts, pk);
   TRACE("");
-  MyEngine_Delete(const_cast<char *>(tbl_name.c_str()), 0, &pk[0], pk.size());
-  delete_index_entries(buf, pk);
-  return 0;
-}
-
-int ha_myengine::delete_all_rows() {
-  TRACE("");
-  return MyEngine_Create(const_cast<char *>(tbl_name.c_str()));
+  return map_rc(MyEngine_RowDelete(txn_h, tbl_h, &pk[0], pk.size()), HA_ERR_INTERNAL_ERROR);
 }
 
 // ---------------------------------------------------------------- 游标与读路径
@@ -267,26 +349,20 @@ void ha_myengine::close_cursor() {
 
 void ha_myengine::open_cursor(uint idx) {
   close_cursor();
-  cur = MyEngine_CursorOpen(const_cast<char *>(tbl_name.c_str()), idx);
+  cur = MyEngine_CursorOpen(txn_h, tbl_h, idx, row_lock, pk_width);
 }
 
-// Go 端合并接口的返回码 -> handler 错误码。
-static inline int fetch_rc(int rc) {
-  if (rc == RC_OK) return 0;
-  return rc == RC_ROW_MISSING ? HA_ERR_KEY_NOT_FOUND : HA_ERR_END_OF_FILE;
-}
-
-// 每行只跨一次语言边界：Go 端完成 移动游标 + (二级索引)回表 + 拷出整行。
+// 每行只跨一次语言边界：Go 端完成 移动游标 + 可见性判断/加锁 + (二级索引)回表 + 拷出整行。
 int ha_myengine::step(uchar *buf, int dir) {
   if (!cur) return HA_ERR_END_OF_FILE;
   size_t len = 0;
-  return fetch_rc(MyEngine_CursorFetch(cur, dir, pk_width, buf, table->s->reclength, &len));
+  return map_rc(MyEngine_CursorFetch(cur, dir, buf, table->s->reclength, &len), HA_ERR_END_OF_FILE);
 }
 
 int ha_myengine::seek_fetch(uchar *buf, const void *key, size_t klen, int mode) {
   size_t len = 0;
-  return fetch_rc(MyEngine_CursorSeekFetch(cur, const_cast<void *>(key), klen, mode, pk_width, buf,
-                                           table->s->reclength, &len));
+  return map_rc(MyEngine_CursorSeekFetch(cur, const_cast<void *>(key), klen, mode, buf, table->s->reclength, &len),
+                HA_ERR_END_OF_FILE);
 }
 
 int ha_myengine::rnd_init(bool scan) {
@@ -305,7 +381,6 @@ int ha_myengine::rnd_end() {
 int ha_myengine::rnd_next(uchar *buf) {
   int e = scan_started ? step(buf, 1) : seek_fetch(buf, nullptr, 0, SEEK_FIRST);
   scan_started = true;
-  if (e == HA_ERR_END_OF_FILE) TRACE("-> HA_ERR_END_OF_FILE");
   return e;
 }
 
@@ -317,8 +392,8 @@ void ha_myengine::position(const uchar *record) {
 
 int ha_myengine::rnd_pos(uchar *buf, uchar *pos) {
   size_t len = 0;
-  int rc = MyEngine_Get(const_cast<char *>(tbl_name.c_str()), 0, pos, pk_width, buf, table->s->reclength, &len);
-  return rc == RC_OK ? 0 : HA_ERR_KEY_NOT_FOUND;
+  int rc = MyEngine_GetRow(txn_h, tbl_h, pos, pk_width, row_lock, buf, table->s->reclength, &len);
+  return map_rc(rc, HA_ERR_KEY_NOT_FOUND);
 }
 
 int ha_myengine::index_init(uint idx, bool sorted) {
@@ -364,23 +439,14 @@ int ha_myengine::index_read_map(uchar *buf, const uchar *key, key_part_map keypa
 
 int ha_myengine::index_next(uchar *buf) { TRACE(""); return step(buf, 1); }
 int ha_myengine::index_prev(uchar *buf) { TRACE(""); return step(buf, -1); }
+int ha_myengine::index_first(uchar *buf) { TRACE(""); return seek_fetch(buf, nullptr, 0, SEEK_FIRST); }
+int ha_myengine::index_last(uchar *buf) { TRACE(""); return seek_fetch(buf, nullptr, 0, SEEK_LAST); }
 
-int ha_myengine::index_first(uchar *buf) {
-  TRACE("");
-  return seek_fetch(buf, nullptr, 0, SEEK_FIRST);
-}
-
-int ha_myengine::index_last(uchar *buf) {
-  TRACE("");
-  return seek_fetch(buf, nullptr, 0, SEEK_LAST);
-}
-
-// ---------------------------------------------------------------- 统计与锁
+// ---------------------------------------------------------------- 统计、语句边界与锁
 
 int ha_myengine::info(uint flag) {
-  long long n = MyEngine_Count(const_cast<char *>(tbl_name.c_str()));
-  TRACE("flag=%u records=%lld", flag, n);
   if (flag & HA_STATUS_ERRKEY) errkey = last_dup_key;
+  long long n = tbl_h ? MyEngine_Count(tbl_h) : 0;
   stats.records = (ha_rows)n;
   stats.deleted = 0;
   stats.mean_rec_length = table->s->reclength;
@@ -389,13 +455,49 @@ int ha_myengine::info(uint flag) {
   return 0;
 }
 
-int ha_myengine::external_lock(THD *, int lock_type) {
-  TRACE("lock_type=%d", lock_type);
+// 语句开始：取得/创建事务，登记到 MySQL 的事务管理，决定本语句对该表的行锁模式。
+int ha_myengine::begin_stmt(THD *thd) {
+  int iso = thd_tx_isolation(thd);
+  unsigned long long h = trx_of(thd);
+  if (!h) {
+    h = MyEngine_TxnBegin(iso);
+    set_trx(thd, h);
+  }
+  MyEngine_TxnStmtBegin(h, iso);
+  trans_register_ha(thd, false, ht, nullptr);                     // 语句级
+  if (in_multi_stmt_txn(thd)) trans_register_ha(thd, true, ht, nullptr);  // 事务级
+  txn_h = h;
+
+  if (stmt_lock_type == TL_READ_WITH_SHARED_LOCKS) {
+    row_lock = LOCK_S;                                  // SELECT ... FOR SHARE
+  } else if (stmt_lock_type >= TL_WRITE_ALLOW_WRITE) {
+    row_lock = LOCK_X;                                  // UPDATE / DELETE / INSERT / SELECT ... FOR UPDATE
+  } else if (iso == ISO_SERIALIZABLE && in_multi_stmt_txn(thd)) {
+    row_lock = LOCK_S;                                  // SERIALIZABLE：普通读也加 S 锁（无间隙锁）
+  } else {
+    row_lock = LOCK_NONE;                               // 一致性(快照)读
+  }
+  TRACE("txn=%llu iso=%d row_lock=%d", h, iso, row_lock);
   return 0;
 }
 
-THR_LOCK_DATA **ha_myengine::store_lock(THD *, THR_LOCK_DATA **to, enum thr_lock_type lock_type) {
-  if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK) lock_data.type = lock_type;
+int ha_myengine::external_lock(THD *thd, int lock_type) {
+  if (lock_type != F_UNLCK) return begin_stmt(thd);
+  return 0;
+}
+
+int ha_myengine::start_stmt(THD *thd, thr_lock_type) { return begin_stmt(thd); }
+
+THR_LOCK_DATA **ha_myengine::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type) {
+  if (lock_type != TL_IGNORE) stmt_lock_type = lock_type;  // 记住原始锁类型，用于决定行锁模式
+  if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK) {
+    // 行级并发由引擎自己的行锁负责：把表级写锁降级，避免不同连接在表级互相阻塞（InnoDB 的做法）
+    if (lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE && !thd_in_lock_tables(thd))
+      lock_type = TL_WRITE_ALLOW_WRITE;
+    else if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
+      lock_type = TL_READ;
+    lock_data.type = lock_type;
+  }
   *to++ = &lock_data;
   return to;
 }
@@ -407,12 +509,12 @@ mysql_declare_plugin(myengine){
     &myengine_storage_engine,
     "MyEngine",
     "myengine",
-    "In-memory B+ tree storage engine: MySQL -> C++ -> CGO -> Go",
+    "In-memory MVCC B+ tree storage engine: MySQL -> C++ -> CGO -> Go",
     PLUGIN_LICENSE_GPL,
     myengine_init,
     nullptr,
     nullptr,
-    0x0002,
+    0x0003,
     nullptr,
     nullptr,
     nullptr,

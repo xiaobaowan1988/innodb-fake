@@ -29,7 +29,7 @@ def t1(args):
 # ---- T2 UNIQUE 竞争：所有客户端抢同样的 300 个 v
 def t2(args):
     a, eng, w = args; cur = conn(a).cursor(); ok = 0
-    vs = list(range(300)); random.Random(w).shuffle(vs)
+    vs = list(range(2000)); random.Random(w).shuffle(vs)
     for v in vs:
         try: cur.execute(f"INSERT INTO uq_{eng} VALUES (%s,%s)", (w * 10000 + v, v)); ok += 1
         except pymysql.err.IntegrityError: pass
@@ -63,7 +63,7 @@ def run(a, eng):
     with mp.Pool(W) as p: oks = p.map(t2, [(a, eng, w) for w in range(W)])
     c.execute(f"SELECT COUNT(*) FROM uq_{eng}"); rows = c.fetchone()[0]
     c.execute(f"SELECT COUNT(*) FROM (SELECT v FROM uq_{eng} IGNORE INDEX(uv) GROUP BY v HAVING COUNT(*)>1) x"); dups = c.fetchone()[0]
-    res["T2 UNIQUE 竞争: 行数 (期望 300) / 重复的 v 个数 (期望 0)"] = f"{rows} / {dups}"
+    res["T2 UNIQUE 竞争(2000个值×8客户端): 行数 (期望 2000) / 重复的 v 个数 (期望 0)"] = f"{rows} / {dups}"
     with mp.Pool(4) as p:
         wr = p.apply_async(t3_writer, ((a, eng, 4000),)); rd = [p.apply_async(t3_reader, ((a, eng, 6),)) for _ in range(3)]
         wr.get(); r = [x.get() for x in rd]

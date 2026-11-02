@@ -154,7 +154,7 @@ type ReadView struct{ snapTS uint64; me *Txn }
 
 ## 6. 阶段与完成标准
 - [x] **P1 纯 Go 核心**：`engine.go` + 单测通过（含 `-race`）。12 个测试；另做了 6 个变异检查（可见性恒真、二级索引不核对、死锁检测失效、不取加锁读、回滚不弹版本、purge 过度）均被测试抓到。
-- [ ] **P2 接入 MySQL**：cgo 层与 C++ handler 改造；`compare_innodb.sh` 仍 147 个结果集一致。
+- [x] **P2 接入 MySQL**：cgo 层与 C++ handler 改造；`compare_innodb.sh` 仍 147 个结果集一致；`concurrency_check.py` 四项异常数均为 0（UNIQUE 加压到 2000 值×8 客户端，连续 2 次 0 重复；此前每轮都重复）。
 - [ ] **P3 场景验证**：`txn_check.py` 全部与 InnoDB 一致；`concurrency_check.py` 四项异常数均为 0。
 - [ ] **P4 收尾**：性能重测、文档更新、限制清单。
 
@@ -177,3 +177,17 @@ type ReadView struct{ snapTS uint64; me *Txn }
      唤醒时必须清掉（`releaseAll` 里已处理）。
   5. 主键被修改的 `Update` 在**应用之前**完成所有检查（新键占用、唯一冲突），失败时不留半截状态，与初稿一致。
   6. 后台 purge 协程由 `StartPurger` 提供，P2 在加载库时启动。
+- v3（P2 完成时）：实现中与初稿不同或初稿未写明的点——
+  1. **cgo 接口按"句柄"组织**：事务、表、游标都是 `runtime/cgo.Handle`（C++ 当作 64 位整数）。
+     新导出：`TxnBegin/TxnStmtBegin/TxnEnd(commit)/TxnRollbackStmt/TxnSavepoint/TxnRollbackTo`、
+     `TableOpen(name,nkeys)/TableClose`、`RowInsert/RowUpdate/RowDelete`（二级索引键打包成 `[idx u32][flags u32][len u32][key]`）、
+     `GetRow`、带事务的 `CursorOpen/SeekFetch/Fetch`、`AutoReserve/AutoInit/AutoBump/IndexLastLatest`；旧的 `Put/Get/Delete` 已移除。
+  2. **事务结束用 `TxnEnd(commit)` 一个函数**（提交或回滚，并释放句柄），C++ 随后把 THD 上的句柄置空。
+  3. **自增每次只预留 1 个值**（不产生空洞，取号本身只是一次原子操作）；初始化用 `IndexLastLatest`
+     （取自增列所在索引上最大键对应的最新未删除行，不管可见性），避免初始化时看不到别的事务未提交的最大值。
+  4. **`table_flags` 增加 `HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE`**（事务引擎应声明）；
+     默认开启 binlog 时没有出现警告或错误，风险项里的 binlog 问题暂未出现。
+  5. **C++ 调用轨迹的开关反了**：事务化之后轨迹太吵，改为默认关闭，`MYENGINE_TRACE=1` 打开
+     （原来的 `MYENGINE_QUIET` 不再使用）。
+  6. **`start_stmt` 也要实现**（`LOCK TABLES` 场景下 MySQL 调它而不是 `external_lock`），与 `external_lock` 共用 `begin_stmt`。
+  7. 表级写锁在 `store_lock` 里降级为 `TL_WRITE_ALLOW_WRITE`（InnoDB 的做法），原始锁类型另存用来决定行锁模式。
