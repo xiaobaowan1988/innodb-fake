@@ -405,3 +405,12 @@ RU/RC 下，加锁扫描遇到会等待的行时，不等锁，改为返回该�
 重跑 seed 100–199 出现 21 个新的"InnoDB 阻塞、我们不阻塞"。InnoDB 的条件是 `!unique_search && index == clust_index`
 （`row_search_mvcc`，`use_semi_consistent`）：完整唯一键的等值查找、以及非聚簇索引上的扫描都不做半一致读。已按此限制（`uniqExact`、`c.idx == 0`），
 并补单元测试和 txn_check 场景。
+
+## v13：全 RC / 全 RR 序列 seed 100–199 的收尾
+
+- 修复：12（pk 变更 UPDATE 撞已有主键只留 S 锁）、13（RC 语句回滚放掉新插入行的锁）、半一致读（v12，含"唯一键等值 / 二级索引不做"的修正）。
+- 全 RC 问题 seed：27 → 23（修复后），seed 100、122、196、140 消失；半一致读第一版曾回归到 43，修正后回到 23。
+- 剩余问题 seed 的首个差异都归入已知类：插入顺序、RC 停止记录（seed 107 最小化：InnoDB 在 RC 下锁了范围外的第一条记录再放掉，被别人的 S 锁挡住）、
+  锁授予/恢复顺序（seed 119、176）。DELETE/REPLACE/INSERT IGNORE 的几个（132、134、141、178、126、158、160、192）未逐个最小化。
+- 回归：Go 单测 `-race` 通过；txn_check 66/66 与 InnoDB 一致；concurrency_check 正常。
+- 未覆盖：全 RR 在新代码上没有重跑；SERIALIZABLE 从未跑过；fuzz 对计时敏感。
