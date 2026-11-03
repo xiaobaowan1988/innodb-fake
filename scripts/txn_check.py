@@ -599,6 +599,13 @@ def rc_update_semi_consistent_read(c):
     c.run("B", "UPDATE gw SET v=7 WHERE id BETWEEN 25 AND 30 AND v=0")                  # 30 的已提交版本匹配：要等（收尾解除）
     c.run("A", "ROLLBACK")
     c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (25, 5, 0)")
+    c.run("B", "UPDATE gw SET v=7 WHERE id=25")                                         # 完整唯一键等值：不做半一致读，要等
+    c.run("A", "ROLLBACK")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (25, 5, 0)")
+    c.run("B", "UPDATE gw SET v=7 WHERE id>=25 AND id<=25")                             # 范围写法：半一致读，跳过
+    c.run("B", "UPDATE gw SET v=7 WHERE e=5")                                           # 经唯一二级索引等值：不是聚簇索引，要等
+    c.run("A", "ROLLBACK")
+    c.run("A", "BEGIN"); c.run("A", "INSERT INTO gw VALUES (25, 5, 0)")
     c.run("R", "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     c.run("R", "UPDATE gw SET v=7 WHERE id BETWEEN 24 AND 26")                          # RR：要等
     c.run("A", "ROLLBACK")

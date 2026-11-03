@@ -1027,6 +1027,27 @@ func TestSemiConsistentRead(t *testing.T) {
 	e.Rollback(w4)
 	<-pending
 	e.Rollback(a4)
+	// 完整唯一键的等值查找（InnoDB 的 unique_search）：不做半一致读，行被别人锁着就等
+	w5 := e.Begin(isoRepeatableRead)
+	if err := e.Update(w5, tb, pk4(3), pk4(3), row8(31), secs(31, false)); err != nil {
+		t.Fatal(err)
+	}
+	a5 := e.Begin(isoReadCommitted)
+	c5 := e.OpenCursor(a5, tb, 0, lockX, 4)
+	c5.SetSemiConsistent(true)
+	type seekRes struct{ err error }
+	ch5 := make(chan seekRes, 1)
+	go func() { _, err := c5.SeekFlags(pk4(3), seekExact, seekUniqueFull); ch5 <- seekRes{err} }()
+	select {
+	case x := <-ch5:
+		t.Fatalf("unique equality lookup must wait, got %v", x.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	e.Rollback(w5)
+	if x := <-ch5; x.err != nil {
+		t.Fatal(x.err)
+	}
+	e.Rollback(a5)
 	// RR：不启用半一致读，照常等待
 	e3, tb3, w3 := setup()
 	a3 := e3.Begin(isoRepeatableRead)

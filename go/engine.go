@@ -1474,6 +1474,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 	e := c.e
 	gap := c.gapMode()
 	firstUniq := false
+	uniqExact := false // InnoDB 的 unique_search：完整唯一键的等值查找（半一致读不适用）
 	if isSeek {
 		dir = seekDir(mode)
 		if seekNeedsPrefix(mode) {
@@ -1484,6 +1485,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		}
 		// 唯一索引全键：精确查找，或范围以 >= K 开始（K 恰好存在时都只加记录锁，不锁它前面的间隙）
 		firstUniq = flags&seekUniqueFull != 0 && (mode == seekExact || mode == seekGE)
+		uniqExact = flags&seekUniqueFull != 0 && mode == seekExact
 		c.done = false
 		c.buf, c.bufPos, c.batchN = c.buf[:0], 0, 2
 	} else if c.done && !c.semiPending { // 乐观读返回的是唯一终点的行：服务器要它的话还得带锁重读，不能直接结束
@@ -1573,7 +1575,7 @@ func (c *Cursor) advance(isSeek bool, key []byte, mode, dir, flags int) ([]byte,
 		_, had := c.t.held[lockKey{c.tbl, 0, string(pk)}]
 		// 加锁读：此刻没有持有任何树锁/gapMu，可以安全地等行锁；醒来后树可能变了，游标会按 key 重新定位
 		policy := c.policy
-		semi := c.semi && !pessimistic && c.t.iso == isoReadCommitted && c.lock == lockX && !had && policy == waitNormal
+		semi := c.semi && !pessimistic && !uniqExact && c.idx == 0 && c.t.iso == isoReadCommitted && c.lock == lockX && !had && policy == waitNormal
 		if semi {
 			policy = waitSkip // 先不等：冲突时走半一致读
 		}

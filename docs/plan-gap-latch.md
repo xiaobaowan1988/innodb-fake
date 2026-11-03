@@ -400,3 +400,8 @@ RU/RC 下，加锁扫描遇到会等待的行时，不等锁，改为返回该�
   `WasSemi()`：`semiRead` 为真则转成 `semiPending` 并返回 true。下一次 `advance`（非 seek）若 `semiPending`：对 `semiPk` 正常（可等待）取锁，
   行还在就返回（`lastFresh` 取首次的 !had）；行已被删就按普通逻辑继续扫描。`Seek` 或游标关闭清除 pending。
 **验证**：单元测试（RC 下跳过未提交插入行/不匹配的锁定行；匹配的行等待后返回；RR 不受影响）、txn_check 场景对照 InnoDB、seed 100 重跑。
+
+**v12 修正（全 RC 重跑暴露的回归）**：第一版把半一致读用在了所有加锁读上，`UPDATE .. WHERE id=N`（完整唯一键等值）和二级索引扫描也被乐观跳过，
+重跑 seed 100–199 出现 21 个新的"InnoDB 阻塞、我们不阻塞"。InnoDB 的条件是 `!unique_search && index == clust_index`
+（`row_search_mvcc`，`use_semi_consistent`）：完整唯一键的等值查找、以及非聚簇索引上的扫描都不做半一致读。已按此限制（`uniqExact`、`c.idx == 0`），
+并补单元测试和 txn_check 场景。
